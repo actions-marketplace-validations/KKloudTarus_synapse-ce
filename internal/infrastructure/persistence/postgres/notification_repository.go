@@ -18,7 +18,10 @@ import (
 	"github.com/KKloudTarus/synapse-ce/internal/usecase/ports"
 )
 
-type NotificationRepository struct{ pool *pgxpool.Pool }
+type NotificationRepository struct {
+	pool               *pgxpool.Pool
+	destinationNotices bool
+}
 
 func NewNotificationRepository(pool *pgxpool.Pool) *NotificationRepository {
 	return &NotificationRepository{pool: pool}
@@ -41,8 +44,10 @@ func (r *NotificationRepository) CreateChannel(ctx context.Context, c notificati
 		if _, err := tx.Exec(ctx, `INSERT INTO notification_channels(tenant_id,id,name,channel_type,enabled,destination,recipients,revision,secret_version,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, c.TenantID, c.ID, c.Name, c.Type, c.Enabled, c.Destination, recipients, c.Revision, c.SecretVersion, c.CreatedAt, c.UpdatedAt); err != nil {
 			return fmt.Errorf("insert notification channel: %w", err)
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO notification_channel_versions(tenant_id,channel_id,version,sealed_config,created_at) VALUES($1,$2,$3,$4,$5)`, c.TenantID, c.ID, c.SecretVersion, sealed, c.CreatedAt)
-		return err
+		if _, err := tx.Exec(ctx, `INSERT INTO notification_channel_versions(tenant_id,channel_id,version,sealed_config,created_at) VALUES($1,$2,$3,$4,$5)`, c.TenantID, c.ID, c.SecretVersion, sealed, c.CreatedAt); err != nil {
+			return err
+		}
+		return r.maybeDestinationNotice(ctx, tx, c, "created")
 	})
 	return c, err
 }
@@ -53,7 +58,8 @@ func (r *NotificationRepository) UpdateChannel(ctx context.Context, c notificati
 	}
 	err := WithTenant(ctx, r.pool, c.TenantID.String(), func(tx pgx.Tx) error {
 		var currentVersion int
-		if err := tx.QueryRow(ctx, `SELECT secret_version FROM notification_channels WHERE tenant_id=$1 AND id=$2 AND deleted_at IS NULL AND revision=$3 FOR UPDATE`, c.TenantID, c.ID, c.Revision-1).Scan(&currentVersion); err != nil {
+		var previousDestination string
+		if err := tx.QueryRow(ctx, `SELECT secret_version, destination FROM notification_channels WHERE tenant_id=$1 AND id=$2 AND deleted_at IS NULL AND revision=$3 FOR UPDATE`, c.TenantID, c.ID, c.Revision-1).Scan(&currentVersion, &previousDestination); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return fmt.Errorf("notification channel revision is stale: %w", shared.ErrConflict)
 			}
@@ -75,7 +81,10 @@ func (r *NotificationRepository) UpdateChannel(ctx context.Context, c notificati
 		if err == nil && !c.Enabled {
 			_, err = tx.Exec(ctx, `UPDATE notification_deliveries d SET state='cancelled',last_error='channel_disabled',next_attempt_at=NULL,updated_at=$3 WHERE tenant_id=$1 AND channel_id=$2 AND state IN ('pending','retrying') AND NOT EXISTS(SELECT 1 FROM notification_delivery_attempts a WHERE a.tenant_id=d.tenant_id AND a.delivery_id=d.id AND a.outcome='started')`, c.TenantID, c.ID, c.UpdatedAt)
 		}
-		return err
+		if err != nil || !replace || notification.SameEndpoint(previousDestination, c.Destination) {
+			return err
+		}
+		return r.maybeDestinationNotice(ctx, tx, c, "host_changed")
 	})
 	return c, err
 }
@@ -181,7 +190,7 @@ func insertRule(ctx context.Context, tx pgx.Tx, r notification.Rule, update bool
 	actions, _ := json.Marshal(r.ActionTypes)
 	engs, _ := json.Marshal(r.EngagementIDs)
 	if update {
-		tag, err := tx.Exec(ctx, `UPDATE notification_rules SET name=$3,enabled=$4,event_type=$5,min_severity=$6,action_types=$7,engagement_ids=$8,lead_time_secs=$9,revision=$10,updated_at=$11,all_teams=$13 WHERE tenant_id=$1 AND id=$2 AND revision=$12`, r.TenantID, r.ID, r.Name, r.Enabled, r.EventType, r.MinSeverity, actions, engs, r.LeadTimeSecs, r.Revision, r.UpdatedAt, r.Revision-1, r.AllTeams)
+		tag, err := tx.Exec(ctx, `UPDATE notification_rules SET name=$3,enabled=$4,event_type=$5,min_severity=$6,action_types=$7,engagement_ids=$8,lead_time_secs=$9,revision=$10,updated_at=$11,all_teams=$13,disabled_reason=$14 WHERE tenant_id=$1 AND id=$2 AND revision=$12`, r.TenantID, r.ID, r.Name, r.Enabled, r.EventType, r.MinSeverity, actions, engs, r.LeadTimeSecs, r.Revision, r.UpdatedAt, r.Revision-1, r.AllTeams, r.DisabledReason)
 		if err != nil {
 			return err
 		}
@@ -195,7 +204,7 @@ func insertRule(ctx context.Context, tx pgx.Tx, r notification.Rule, update bool
 			return err
 		}
 	} else {
-		if _, err := tx.Exec(ctx, `INSERT INTO notification_rules(tenant_id,id,name,enabled,event_type,min_severity,action_types,engagement_ids,lead_time_secs,revision,created_at,updated_at,all_teams) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, r.TenantID, r.ID, r.Name, r.Enabled, r.EventType, r.MinSeverity, actions, engs, r.LeadTimeSecs, r.Revision, r.CreatedAt, r.UpdatedAt, r.AllTeams); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO notification_rules(tenant_id,id,name,enabled,event_type,min_severity,action_types,engagement_ids,lead_time_secs,revision,created_at,updated_at,all_teams,disabled_reason) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, r.TenantID, r.ID, r.Name, r.Enabled, r.EventType, r.MinSeverity, actions, engs, r.LeadTimeSecs, r.Revision, r.CreatedAt, r.UpdatedAt, r.AllTeams, r.DisabledReason); err != nil {
 			return err
 		}
 	}
@@ -257,14 +266,14 @@ func (r *NotificationRepository) ListRules(ctx context.Context, tenant shared.ID
 	return out, err
 }
 
-const ruleSelect = `SELECT r.tenant_id,r.id,r.name,r.enabled,r.event_type,r.min_severity,r.action_types,r.engagement_ids,r.lead_time_secs,r.revision,r.created_at,r.updated_at,COALESCE(jsonb_agg(rc.channel_id ORDER BY rc.channel_id) FILTER(WHERE rc.channel_id IS NOT NULL),'[]'),r.all_teams,COALESCE((SELECT jsonb_agg(rt.team_id ORDER BY rt.team_id) FROM notification_rule_teams rt WHERE rt.tenant_id=r.tenant_id AND rt.rule_id=r.id),'[]') FROM notification_rules r LEFT JOIN notification_rule_channels rc ON rc.tenant_id=r.tenant_id AND rc.rule_id=r.id`
+const ruleSelect = `SELECT r.tenant_id,r.id,r.name,r.enabled,r.event_type,r.min_severity,r.action_types,r.engagement_ids,r.lead_time_secs,r.revision,r.created_at,r.updated_at,COALESCE(jsonb_agg(rc.channel_id ORDER BY rc.channel_id) FILTER(WHERE rc.channel_id IS NOT NULL),'[]'),r.all_teams,COALESCE((SELECT jsonb_agg(rt.team_id ORDER BY rt.team_id) FROM notification_rule_teams rt WHERE rt.tenant_id=r.tenant_id AND rt.rule_id=r.id),'[]'),r.disabled_reason FROM notification_rules r LEFT JOIN notification_rule_channels rc ON rc.tenant_id=r.tenant_id AND rc.rule_id=r.id`
 
 type scanner interface{ Scan(...any) error }
 
 func scanRule(row scanner, out *notification.Rule) error {
 	var typ string
 	var actions, engs, channels, teams []byte
-	if err := row.Scan(&out.TenantID, &out.ID, &out.Name, &out.Enabled, &typ, &out.MinSeverity, &actions, &engs, &out.LeadTimeSecs, &out.Revision, &out.CreatedAt, &out.UpdatedAt, &channels, &out.AllTeams, &teams); err != nil {
+	if err := row.Scan(&out.TenantID, &out.ID, &out.Name, &out.Enabled, &typ, &out.MinSeverity, &actions, &engs, &out.LeadTimeSecs, &out.Revision, &out.CreatedAt, &out.UpdatedAt, &channels, &out.AllTeams, &teams, &out.DisabledReason); err != nil {
 		return err
 	}
 	out.EventType = notification.EventType(typ)
@@ -341,16 +350,28 @@ func (r *NotificationRepository) publishTx(ctx context.Context, tx pgx.Tx, e not
 		if err != nil {
 			return nil, err
 		}
-		defer rows.Close()
 		var ids []shared.ID
 		for rows.Next() {
 			var id shared.ID
 			if err := rows.Scan(&id); err != nil {
+				rows.Close()
 				return nil, err
 			}
 			ids = append(ids, id)
 		}
-		return ids, rows.Err()
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+		// The source row already exists, but retention may have removed the inbox
+		// projection. Re-apply it so the tombstone, not the event conflict, decides
+		// whether the row comes back.
+		e.ID = existing
+		if err := r.projectPersonal(ctx, tx, e); err != nil {
+			return nil, err
+		}
+		return ids, nil
 	}
 
 	type target struct {
@@ -447,8 +468,13 @@ func (r *NotificationRepository) publishTx(ctx context.Context, tx pgx.Tx, e not
 	}
 	matched, _ := json.Marshal(allRules)
 	revisionJSON, _ := json.Marshal(revisions)
-	_, err = tx.Exec(ctx, `UPDATE notification_events SET matched_rules=$3,rule_revisions=$4 WHERE tenant_id=$1 AND id=$2`, e.TenantID, e.ID, matched, revisionJSON)
-	return ids, err
+	if _, err = tx.Exec(ctx, `UPDATE notification_events SET matched_rules=$3,rule_revisions=$4 WHERE tenant_id=$1 AND id=$2`, e.TenantID, e.ID, matched, revisionJSON); err != nil {
+		return nil, err
+	}
+	if err = r.projectPersonal(ctx, tx, e); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 func (r *NotificationRepository) GetDelivery(ctx context.Context, tenant, id shared.ID) (notification.Delivery, error) {
@@ -580,6 +606,22 @@ func (r *NotificationRepository) LoadWork(ctx context.Context, tenant, did share
 
 func (r *NotificationRepository) DeliveryStillRelevant(ctx context.Context, work ports.NotificationWork) (bool, error) {
 	switch work.Event.Type {
+	case notification.EventScanCompleted:
+		// An event can remain queued after a job changes status. Check the
+		// authoritative job before sending, not just the captured event.
+		if work.Event.SourceKind != "scan_job" {
+			return true, nil
+		}
+		var relevant bool
+		err := WithTenant(ctx, r.pool, work.Event.TenantID.String(), func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `SELECT EXISTS(
+				SELECT 1 FROM scan_jobs j
+				JOIN engagements e ON e.id=j.engagement_id
+				WHERE e.tenant_id=$1 AND j.id=$2 AND j.status='succeeded'
+					AND j.finished_at IS NOT NULL
+			)`, work.Event.TenantID, work.Event.SourceID).Scan(&relevant)
+		})
+		return relevant, err
 	case notification.EventSLAApproaching:
 		var data struct {
 			AssessmentID string    `json:"assessment_id"`
@@ -726,12 +768,32 @@ func (r *NotificationRepository) CancelDelivery(ctx context.Context, tenant, did
 	})
 }
 
-func (r *NotificationRepository) DeadLetterDelivery(ctx context.Context, tenant, did shared.ID, reason string) error {
-	return WithTenant(ctx, r.pool, tenant.String(), func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `WITH changed AS (UPDATE notification_deliveries d SET state='dead_letter',last_error=$3,next_attempt_at=NULL,updated_at=now() WHERE tenant_id=$1 AND id=$2 AND state IN ('pending','retrying') AND EXISTS(SELECT 1 FROM jobs j WHERE j.tenant_id=d.tenant_id AND j.id='notification-'||d.id AND j.status='failed') RETURNING id)
-        INSERT INTO notification_audit_intents(tenant_id,id,delivery_id,action,error_code,occurred_at) SELECT $1,'dead:'||id,id,'notification.delivery_failed',$3,now() FROM changed ON CONFLICT DO NOTHING`, tenant, did, sanitizeError(reason))
+func (r *NotificationRepository) DeadLetterDelivery(ctx context.Context, tenant, did shared.ID, reason string) (bool, error) {
+	changed := false
+	err := WithTenant(ctx, r.pool, tenant.String(), func(tx pgx.Tx) error {
+		// The delivery and its queue job are locked/updated in the same
+		// transaction, so racing callbacks cannot both claim the transition.
+		tag, err := tx.Exec(ctx, `UPDATE notification_deliveries d
+			SET state='dead_letter',last_error=$3,next_attempt_at=NULL,updated_at=now()
+			WHERE tenant_id=$1 AND id=$2 AND state IN ('pending','retrying')
+			AND EXISTS(SELECT 1 FROM jobs j WHERE j.tenant_id=d.tenant_id
+				AND j.id='notification-'||d.id AND j.status='failed')`, tenant, did, sanitizeError(reason))
+		if err != nil || tag.RowsAffected() == 0 {
+			return err
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO notification_audit_intents
+			(tenant_id,id,delivery_id,action,error_code,occurred_at)
+			VALUES($1,'dead:'||$2,$2,'notification.delivery_failed',$3,now())
+			ON CONFLICT DO NOTHING`, tenant, did, sanitizeError(reason))
+		if err == nil {
+			changed = true
+		}
 		return err
 	})
+	if err != nil {
+		return false, err // a transaction that failed to commit changed nothing
+	}
+	return changed, nil
 }
 
 func stableID(parts ...string) shared.ID {

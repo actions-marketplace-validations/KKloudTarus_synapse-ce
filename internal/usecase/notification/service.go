@@ -33,6 +33,7 @@ type Service struct {
 	audit     ports.AuditLogger
 	clock     ports.Clock
 	ids       ports.IDGenerator
+	observer  ports.NotificationDeliveryObserver
 }
 
 func NewService(repo ports.NotificationRepository, protector ports.NotificationSecretProtector, sender ports.NotificationSender, audit ports.AuditLogger, clock ports.Clock, ids ports.IDGenerator) (*Service, error) {
@@ -40,6 +41,23 @@ func NewService(repo ports.NotificationRepository, protector ports.NotificationS
 		return nil, fmt.Errorf("%w: notification dependencies are required", shared.ErrValidation)
 	}
 	return &Service{repo: repo, protector: protector, sender: sender, audit: audit, clock: clock, ids: ids}, nil
+}
+
+// SetDeliveryObserver installs optional worker-owned metrics instrumentation.
+func (s *Service) SetDeliveryObserver(observer ports.NotificationDeliveryObserver) {
+	s.observer = observer
+}
+
+func (s *Service) observeAttempt(channel domain.ChannelType, began, finished time.Time, delivered, fallback bool) {
+	if s.observer != nil {
+		s.observer.ObserveNotificationAttempt(channel, finished.Sub(began), delivered, fallback)
+	}
+}
+
+func (s *Service) observeDeadLetter(channel domain.ChannelType) {
+	if s.observer != nil {
+		s.observer.ObserveNotificationDeadLetter(channel)
+	}
 }
 
 type ChannelInput struct {
@@ -74,7 +92,7 @@ func (s *Service) createChannel(ctx context.Context, actor string, in ChannelInp
 		return domain.Channel{}, err
 	}
 	c := domain.Channel{TenantID: tenant, ID: id, Name: strings.TrimSpace(in.Name), Type: in.Type, Enabled: in.Enabled, Destination: destination, Recipients: recipients, Revision: 1, SecretVersion: 1, CreatedAt: now, UpdatedAt: now}
-	created, err := s.repo.CreateChannel(ctx, c, sealed)
+	created, err := s.repo.CreateChannel(domain.WithActor(ctx, actor), c, sealed)
 	if err != nil {
 		return domain.Channel{}, fmt.Errorf("create notification channel: %w", err)
 	}
@@ -134,7 +152,7 @@ func (s *Service) updateChannel(ctx context.Context, actor string, id shared.ID,
 	if updated.Name == "" {
 		return domain.Channel{}, fmt.Errorf("%w: notification channel name is required", shared.ErrValidation)
 	}
-	updated, err = s.repo.UpdateChannel(ctx, updated, sealed, replace)
+	updated, err = s.repo.UpdateChannel(domain.WithActor(ctx, actor), updated, sealed, replace)
 	if err != nil {
 		return domain.Channel{}, err
 	}
@@ -298,23 +316,6 @@ func (s *Service) ListAttempts(ctx context.Context, did shared.ID) ([]domain.Att
 	}
 	return s.repo.ListAttempts(ctx, tenant, did)
 }
-func (s *Service) Publish(ctx context.Context, e domain.Event) ([]shared.ID, error) {
-	tenant, err := tenantFrom(ctx)
-	if err != nil {
-		return nil, err
-	}
-	e.TenantID = tenant
-	if e.ID.IsZero() {
-		e.ID = s.ids.NewID()
-	}
-	if e.SchemaVersion == 0 {
-		e.SchemaVersion = 1
-	}
-	if e.OccurredAt.IsZero() {
-		e.OccurredAt = s.clock.Now().UTC()
-	}
-	return s.repo.Publish(ctx, e)
-}
 
 func (s *Service) seal(tenant, id shared.ID, version int, cfg ports.NotificationChannelConfig) (string, error) {
 	//nolint:gosec // The secret-bearing configuration is immediately sealed and is never persisted or logged as plaintext.
@@ -457,16 +458,22 @@ func (s *Service) HandleJob(ctx context.Context, job ports.QueuedJob) error {
 	}
 	raw, err := s.protector.Open(work.Sealed, channelAAD(job.TenantID, work.Channel.ID, work.Channel.SecretVersion))
 	if err != nil {
-		if finishErr := s.repo.FinishAttempt(ctx, job.TenantID, payload.DeliveryID, job.ID, job.Fence, aid, s.clock.Now().UTC(), "failed", 0, "channel_secret_unavailable", nil); finishErr != nil {
+		finished := s.clock.Now().UTC()
+		if finishErr := s.repo.FinishAttempt(ctx, job.TenantID, payload.DeliveryID, job.ID, job.Fence, aid, finished, "failed", 0, "channel_secret_unavailable", nil); finishErr != nil {
 			return finishErr
 		}
+		s.observeAttempt(work.Delivery.ChannelType, now, finished, false, false)
+		s.observeDeadLetter(work.Delivery.ChannelType)
 		return &DeliveryError{terminal: true, cause: errors.New("channel_secret_unavailable")}
 	}
 	var cfg ports.NotificationChannelConfig
 	if json.Unmarshal(raw, &cfg) != nil {
-		if finishErr := s.repo.FinishAttempt(ctx, job.TenantID, payload.DeliveryID, job.ID, job.Fence, aid, s.clock.Now().UTC(), "failed", 0, "channel_config_invalid", nil); finishErr != nil {
+		finished := s.clock.Now().UTC()
+		if finishErr := s.repo.FinishAttempt(ctx, job.TenantID, payload.DeliveryID, job.ID, job.Fence, aid, finished, "failed", 0, "channel_config_invalid", nil); finishErr != nil {
 			return finishErr
 		}
+		s.observeAttempt(work.Delivery.ChannelType, now, finished, false, false)
+		s.observeDeadLetter(work.Delivery.ChannelType)
 		return &DeliveryError{terminal: true, cause: errors.New("channel_config_invalid")}
 	}
 	result := s.sender.Send(ctx, work, cfg)
@@ -475,6 +482,7 @@ func (s *Service) HandleJob(ctx context.Context, job ports.QueuedJob) error {
 		if err = s.repo.FinishAttempt(ctx, job.TenantID, payload.DeliveryID, job.ID, job.Fence, aid, finished, "delivered", result.StatusCode, "", nil); err != nil {
 			return err
 		}
+		s.observeAttempt(work.Delivery.ChannelType, now, finished, true, result.TemplateFallback)
 		return nil
 	}
 	terminal := !result.Retryable || job.Attempts >= 8
@@ -499,6 +507,10 @@ func (s *Service) HandleJob(ctx context.Context, job ports.QueuedJob) error {
 	if err = s.repo.FinishAttempt(ctx, job.TenantID, payload.DeliveryID, job.ID, job.Fence, aid, finished, outcome, result.StatusCode, code, nextPtr); err != nil {
 		return err
 	}
+	s.observeAttempt(work.Delivery.ChannelType, now, finished, false, result.TemplateFallback)
+	if terminal {
+		s.observeDeadLetter(work.Delivery.ChannelType)
+	}
 	return &DeliveryError{after: after, terminal: terminal, cause: errors.New(code)}
 }
 func (s *Service) OnDeadLetter(ctx context.Context, job ports.QueuedJob, cause error) error {
@@ -508,12 +520,22 @@ func (s *Service) OnDeadLetter(ctx context.Context, job ports.QueuedJob, cause e
 	if json.Unmarshal(job.Payload, &p) != nil || p.DeliveryID.IsZero() {
 		return nil
 	}
-	d, err := s.repo.GetDelivery(shared.WithTenant(ctx, job.TenantID), job.TenantID, p.DeliveryID)
+	tenantCtx := shared.WithTenant(ctx, job.TenantID)
+	d, err := s.repo.GetDelivery(tenantCtx, job.TenantID, p.DeliveryID)
 	if err != nil {
 		return err
 	}
-	if err == nil && (d.State == domain.DeliveryPending || d.State == domain.DeliveryRetrying) {
-		return s.repo.DeadLetterDelivery(shared.WithTenant(ctx, job.TenantID), job.TenantID, p.DeliveryID, "worker_dead_letter")
+	if d.State != domain.DeliveryPending && d.State != domain.DeliveryRetrying {
+		return nil // already terminal: do not count the same dead letter twice
+	}
+	transitioned, err := s.repo.DeadLetterDelivery(tenantCtx, job.TenantID, p.DeliveryID, "worker_dead_letter")
+	if err != nil {
+		return err
+	}
+	// Count only the transition committed by this callback. Re-reading a
+	// dead row would double-count when two callbacks raced on the same job.
+	if transitioned {
+		s.observeDeadLetter(d.ChannelType)
 	}
 	return nil
 }
