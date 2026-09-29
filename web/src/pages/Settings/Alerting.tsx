@@ -5,6 +5,7 @@ import type {
   NotificationChannel,
   NotificationChannelType,
   NotificationDelivery,
+  NotificationSourceFailure,
   NotificationEventSpec,
   NotificationEventType,
   NotificationRule,
@@ -83,8 +84,11 @@ export function Alerting() {
       return
     }
     setDisabled(null)
-    const types = capabilities?.get('notifications.channel_types')?.values
-    setChannelTypes(types && types.length > 0 ? types : null)
+    // An enabled notifications.channel_types is authoritative: the server leaves out the types the
+    // operator switched off, and an empty list means every type is off. A server that does not
+    // report it gets every known type.
+    const types = capabilities?.get('notifications.channel_types')
+    setChannelTypes(types?.enabled ? (types.values ?? []) : null)
     try {
       setChannels(await api.listNotificationChannels())
       void loadCatalog()
@@ -136,6 +140,7 @@ export function Alerting() {
           {channels && (
             <ChannelList
               channels={channels}
+              types={channelTypes}
               canAdmin={canAdmin}
               refresh={load}
               notify={notify}
@@ -289,6 +294,21 @@ const CHANNEL_TYPES: { value: NotificationChannelType; label: string }[] = [
   { value: 'email', label: 'Email (SMTP)' },
 ]
 
+const PROVIDERS_DISABLED_SWITCH = 'SYNAPSE_NOTIFICATION_PROVIDERS_DISABLED'
+
+/**
+ * Whether the operator switched this channel type off deployment-wide. The server leaves such types
+ * out of `notifications.channel_types`; `types` is null when it does not report the list, and then
+ * nothing is known to be off.
+ */
+function operatorDisabled(type: string, types: string[] | null): boolean {
+  return !!types && !types.includes(type)
+}
+
+function operatorDisabledHint(type: string): string {
+  return `The operator disabled ${type} channels for this deployment (${PROVIDERS_DISABLED_SWITCH}), so this channel delivers nothing until it is turned back on.`
+}
+
 function ChannelCreate({
   initial,
   canAdmin,
@@ -350,10 +370,25 @@ function ChannelCreate({
       setBusy(false)
     }
   }
+  if (!initial && typeOptions.length === 0)
+    return (
+      <Card title="Add notification channel">
+        <p className="text-sm text-tertiary">
+          The operator has disabled every notification channel type with{' '}
+          <code>{PROVIDERS_DISABLED_SWITCH}</code>, so no channel can be added.
+        </p>
+      </Card>
+    )
   return (
     <Card
       title={initial ? 'Edit notification channel' : 'Add notification channel'}
     >
+      {initial && operatorDisabled(initial.type, types) && (
+        <p className="mb-4 text-sm text-warning-primary">
+          {operatorDisabledHint(initial.type)} You can rename it or switch it
+          off, but not switch it on or change its destination.
+        </p>
+      )}
       {initial && (
         <p className="mb-4 text-sm text-tertiary">
           Leave URL and secret blank to keep them. To replace a webhook
@@ -526,12 +561,15 @@ function ChannelHealthHistory({ channelId }: { channelId: string }) {
 export function ChannelList({
   onEdit,
   channels,
+  types,
   canAdmin,
   refresh,
   notify,
 }: {
   onEdit: (channel: NotificationChannel) => void
   channels: NotificationChannel[]
+  /** Channel types the server advertises; null means it does not say. */
+  types: string[] | null
   canAdmin: boolean
   refresh: () => void
   notify: (message: string, tone?: 'success' | 'error' | 'info') => void
@@ -567,6 +605,9 @@ export function ChannelList({
       <ul className="divide-y divide-secondary">
         {channels.map((c) => {
           const paused = c.health?.state === 'paused'
+          // A channel of a type the operator switched off keeps its settings but delivers nothing,
+          // and the server refuses to test it or switch it on, so say why instead of failing.
+          const offByOperator = operatorDisabled(c.type, types)
           return (
           <li
             key={c.id}
@@ -591,8 +632,18 @@ export function ChannelList({
                   </Pill>
                 )}
                 <Pill>{c.type}</Pill>
+                {offByOperator && (
+                  <Pill className="text-warning-primary">
+                    Disabled by operator
+                  </Pill>
+                )}
               </div>
               <p className="truncate text-sm text-tertiary">{c.destination}</p>
+              {offByOperator && (
+                <p className="text-sm text-warning-primary">
+                  {operatorDisabledHint(c.type)}
+                </p>
+              )}
               <ChannelHealthLine channel={c} />
               {historyFor === c.id && (
                 <div className="mt-2">
@@ -622,8 +673,14 @@ export function ChannelList({
             </Button>
             <Button
               variant="secondary"
-              disabled={!canAdmin || paused}
-              title={paused ? 'Resume the channel before sending a test.' : undefined}
+              disabled={!canAdmin || paused || offByOperator}
+              title={
+                paused
+                  ? 'Resume the channel before sending a test.'
+                  : offByOperator
+                    ? 'The operator disabled this channel type for the deployment.'
+                    : undefined
+              }
               onClick={async () => {
                 await action(async () => {
                   const r = await api.testNotificationChannel(c.id)
@@ -637,7 +694,7 @@ export function ChannelList({
             </Button>
             <Button
               variant="secondary"
-              disabled={!canAdmin}
+              disabled={!canAdmin || (offByOperator && !c.enabled)}
               onClick={() => void action(() => toggle(c))}
             >
               {c.enabled ? 'Disable' : 'Enable'}
@@ -1151,6 +1208,11 @@ function DeliveryHistory({
       setBusy(true)
       setError(null)
       try {
+        if (state === 'quarantined') {
+          setItems([])
+          setNext(undefined)
+          return
+        }
         const page = await api.notificationDeliveryPage({
           channel_id: channel === 'all' ? undefined : channel,
           event_type: event === 'all' ? undefined : event,
@@ -1233,6 +1295,7 @@ function DeliveryHistory({
             options={[
               { value: 'all', label: 'All states' },
               ...Object.keys(stateTone).map((s) => ({ value: s, label: s })),
+              { value: 'quarantined', label: 'Quarantined sources' },
             ]}
           />
         </Field>
@@ -1255,12 +1318,12 @@ function DeliveryHistory({
       </div>
       {error && <ErrorState message={error} />}
       {busy && <Spinner label="Loading deliveries…" />}
-      {!busy && items.length === 0 && (
+      {!busy && state !== 'quarantined' && items.length === 0 && (
         <p className="text-sm text-tertiary">
           No deliveries match these filters.
         </p>
       )}
-      {items.length > 0 && (
+      {state !== 'quarantined' && items.length > 0 && (
         <div className="overflow-x-auto">
           <table className="w-full text-left text-sm">
             <thead className="border-b border-secondary text-tertiary">
@@ -1316,6 +1379,12 @@ function DeliveryHistory({
           Load more
         </Button>
       )}
+      {(state === 'all' || state === 'quarantined') && channel === 'all' && (
+        <QuarantinedSources event={event} from={from} to={to} />
+      )}
+      {state === 'quarantined' && channel !== 'all' && (
+        <p className="text-sm text-tertiary">Quarantined sources have no channel. Select All channels to view them.</p>
+      )}
       {selected && (
         <div className="mt-5 space-y-2 border-t border-secondary pt-4">
           <p className="text-sm font-semibold text-primary">
@@ -1340,6 +1409,57 @@ function DeliveryHistory({
         </div>
       )}
     </Card>
+  )
+}
+
+export function QuarantinedSources({ event, from, to }: { event: string; from: string; to: string }) {
+  const requestID = useRef(0)
+  const [items, setItems] = useState<NotificationSourceFailure[]>([])
+  const [nextOffset, setNextOffset] = useState<number>()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const load = useCallback(async (offset = 0) => {
+    const request = ++requestID.current
+    setBusy(true)
+    setError(null)
+    try {
+      const page = await api.notificationSourceFailurePage({
+        event_type: event === 'all' ? undefined : event,
+        from: from ? new Date(from).toISOString() : undefined,
+        to: to ? new Date(to).toISOString() : undefined,
+        offset,
+      })
+      if (request !== requestID.current) return
+      setItems((old) => offset ? [...old, ...page.items] : page.items)
+      setNextOffset(page.next_offset)
+    } catch (e) {
+      if (request === requestID.current)
+        setError(e instanceof Error ? e.message : 'Could not load quarantined sources')
+    } finally {
+      if (request === requestID.current) setBusy(false)
+    }
+  }, [event, from, to])
+  useEffect(() => { void load() }, [load])
+  return (
+    <section className="mt-6 border-t border-secondary pt-4" aria-label="Quarantined sources">
+      <div className="mb-3 flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-primary">Quarantined sources</h3>
+        <Button variant="secondary" disabled={busy} onClick={() => void load()}>Refresh</Button>
+      </div>
+      <p className="mb-3 text-sm text-secondary">These captured events failed validation before any delivery was queued. Their payloads are hidden.</p>
+      {error && <ErrorState message={error} />}
+      {busy && <Spinner label="Loading quarantined sources…" />}
+      {!busy && items.length === 0 && !error && <p className="text-sm text-tertiary">No quarantined sources match these filters.</p>}
+      {items.length > 0 && <div className="overflow-x-auto"><table className="w-full text-left text-sm">
+        <thead className="border-b border-secondary text-tertiary"><tr><th className="p-3">Quarantined</th><th className="p-3">Event / source</th><th className="p-3">Reason</th></tr></thead>
+        <tbody className="divide-y divide-secondary">{items.map((item) => <tr key={`${item.source_kind}:${item.source_id}`}>
+          <td className="p-3 text-secondary">{new Date(item.processed_at).toLocaleString()}</td>
+          <td className="p-3 text-secondary">{item.event_type}<p className="text-xs text-tertiary">{item.source_kind}: {item.source_id}</p></td>
+          <td className="p-3"><Pill className="text-error-primary">Quarantined</Pill><p className="text-xs text-error-primary">{item.failed_reason === 'event_data_too_large' ? 'Event data exceeds 16 KiB' : 'Invalid event'}</p></td>
+        </tr>)}</tbody>
+      </table></div>}
+      {nextOffset !== undefined && <Button variant="secondary" disabled={busy} onClick={() => void load(nextOffset)}>Load more quarantined sources</Button>}
+    </section>
   )
 }
 

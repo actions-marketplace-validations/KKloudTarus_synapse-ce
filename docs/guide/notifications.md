@@ -62,6 +62,40 @@ disabled by default. The development memory store does not emulate durable deliv
 `SYNAPSE_NOTIFICATION_SMTP_REQUIRE_TLS=false` is intended only for a controlled
 development relay. Production relays must support verified STARTTLS.
 
+### Disable a channel type deployment-wide
+
+An operator can switch off any channel or provider type for every tenant, for
+example while a vendor is compromised or a relay is being replaced:
+
+```text
+SYNAPSE_NOTIFICATION_PROVIDERS_DISABLED=slack,email
+```
+
+Set the same value on `synapse-api` and `synapse-worker` and restart both. The
+list is comma-separated, case-insensitive, and ignores blanks and repeats. Each
+entry must name a type in the notification driver registry (`webhook`, `slack`,
+`email` in this build); an unknown name stops startup, so a typo cannot leave
+the type you meant to disable switched on.
+
+While a type is disabled:
+
+- `GET /api/v1/capabilities` leaves it out of `notifications.channel_types`, so
+  **Settings → Alerting** no longer offers it for a new channel.
+- Creating or testing a channel of that type answers `400` with a message naming
+  the type and the variable. An existing channel of that type cannot be switched
+  on or pointed at a new destination; it can still be renamed, switched off or
+  deleted. The console marks it **Disabled by operator** and hides its test and
+  enable actions.
+- The worker cancels each queued delivery for it with `provider_disabled` before
+  any connection is made. The cancellation is not a failure: it is not retried,
+  does not dead-letter, and is never counted against the channel's own health,
+  because the operator, not the channel, caused it.
+
+Existing channels and their sealed configuration are kept. Removing the type
+from the variable and restarting restores them; deliveries cancelled in the
+meantime are not replayed. The switch covers tenant channels only; personal
+inbox email and contact verification email use the SMTP relay directly.
+
 ## Configure routing
 
 Open **Settings → Alerting**. Create a channel, test it, then create rules for one
@@ -171,6 +205,12 @@ and durable jobs, and marks the record processed in one transaction. Risk outbox
 handoff uses the same atomic boundary. Multiple matching rules collapse to one
 delivery per channel (per recipient for email), with matched rule revisions retained.
 No-match events are recorded and are not replayed when a rule is added later.
+
+If a captured source fails event validation, the worker quarantines that source
+and continues with the next one in the same poll. Delivery history shows its
+event type, source identity and a fixed reason code; captured payloads are never
+returned. An oversized event reports `event_data_too_large`; other validation
+failures report `invalid_event`. Quarantined sources are not retried automatically.
 
 SLA and fleet relevance is checked again immediately before sending. Resolving an
 SLA, changing its assessment/deadline, entering an exception, passing the deadline,

@@ -24,6 +24,11 @@ func (v ChannelType) Valid() bool {
 	return v == ChannelWebhook || v == ChannelSlack || v == ChannelEmail
 }
 
+// CodeProviderDisabled is the reason a delivery is cancelled when the operator switched its channel
+// type off with SYNAPSE_NOTIFICATION_PROVIDERS_DISABLED. The operator owns it: it is never a fault
+// of the channel, so channel health must not count it and the channel is not retried for it.
+const CodeProviderDisabled = "provider_disabled"
+
 type EventType string
 
 const (
@@ -265,6 +270,22 @@ type Attempt struct {
 type Page struct {
 	Items []Delivery `json:"items"`
 	Next  string     `json:"next,omitempty"`
+}
+
+// SourceFailure is a captured event that could not be projected. It contains
+// source identity and a fixed reason code, never the captured payload.
+type SourceFailure struct {
+	SourceKind   string    `json:"source_kind"`
+	SourceID     string    `json:"source_id"`
+	EventType    EventType `json:"event_type"`
+	OccurredAt   time.Time `json:"occurred_at"`
+	ProcessedAt  time.Time `json:"processed_at"`
+	FailedReason string    `json:"failed_reason"`
+}
+
+type SourceFailurePage struct {
+	Items      []SourceFailure `json:"items"`
+	NextOffset *int            `json:"next_offset,omitempty"`
 }
 
 func uniqueStrings(in []string) []string {
