@@ -39,7 +39,8 @@ type Service struct {
 	ids       ports.IDGenerator
 	observer  ports.NotificationDeliveryObserver
 	// disabled holds the channel types the operator switched off deployment-wide.
-	disabled map[domain.ChannelType]bool
+	disabled        map[domain.ChannelType]bool
+	selfHostedHosts map[string]bool
 	// pauseThreshold is the number of consecutive permanent failures that pauses a channel (#1464).
 	pauseThreshold int
 	// templates stores tenant message templates (#1370); nil disables the template API.
@@ -60,6 +61,15 @@ type Service struct {
 	// two samples a template preview renders against (#1372).
 	fixtures    fs.FS
 	eventReader ports.NotificationEventReader
+	// emailSettings owns the tenant relay and verified recipient/domain policy.
+	emailSettings    ports.NotificationEmailSettingsStore
+	emailTXT         ports.NotificationTXTResolver
+	smtpAllowedHosts map[string]bool
+	// slack reads a Slack workspace for Slack bot channels (#1383); nil refuses them.
+	slack ports.SlackWorkspace
+	// slackDirect sends the Slack app's direct messages (#1419); console builds their links.
+	slackDirect ports.SlackDirectSender
+	console     *consolelink.Builder
 }
 
 // SetDisabledChannelTypes installs the operator kill switch (SYNAPSE_NOTIFICATION_PROVIDERS_DISABLED),
@@ -127,7 +137,17 @@ type ChannelInput struct {
 	// destination change and needs the token re-entered.
 	ChatID   string `json:"chat_id,omitempty"`
 	ThreadID int64  `json:"thread_id,omitempty"`
-	Revision int    `json:"revision,omitempty"`
+	// ConversationID is a Slack bot channel's conversation (C…); the bot token travels in Secret.
+	// Like a Telegram chat it is part of the destination, so changing it needs the token again.
+	ConversationID string `json:"conversation_id,omitempty"`
+	// AllowSharedConversation lets a Slack bot channel post into a Slack Connect or
+	// organisation-shared conversation (#1383). It is part of the destination: only an
+	// administrator sets it, together with the bot token.
+	AllowSharedConversation bool `json:"allow_shared_conversation,omitempty"`
+	// verified is the destination prepareDestination already checked with its provider, before the
+	// transaction opened. It is never decoded from a request.
+	verified ports.NotificationChannelConfig
+	Revision int `json:"revision,omitempty"`
 	// AllowDestinationChange is set by the caller, never decoded from a request: true only when the
 	// principal holds PermAdminister. Without it an update that changes the URL, the secret or the
 	// email recipients is refused with shared.ErrForbidden (#1358), so an integration_admin can
@@ -169,8 +189,16 @@ func (s *Service) createChannel(ctx context.Context, actor string, in ChannelInp
 		return domain.Channel{}, fmt.Errorf("notification channel limit reached: %w", shared.ErrSaturated)
 	}
 	id, now := s.ids.NewID(), s.clock.Now().UTC()
-	config, destination, recipients, err := validateChannel(in, true)
+	config, destination, recipients, err := s.validateChannelInput(in, true)
 	if err != nil {
+		return domain.Channel{}, err
+	}
+	if in.Type == domain.ChannelEmail {
+		if err = s.validateEmailRecipients(ctx, tenant, recipients); err != nil {
+			return domain.Channel{}, err
+		}
+	}
+	if config, err = s.verifiedDestination(ctx, in, config); err != nil {
 		return domain.Channel{}, err
 	}
 	sealed, err := s.seal(tenant, id, 1, config)
@@ -216,7 +244,7 @@ func (s *Service) updateChannel(ctx context.Context, actor string, id shared.ID,
 	if in.Type != current.Type {
 		return domain.Channel{}, fmt.Errorf("%w: channel type is immutable", shared.ErrValidation)
 	}
-	replace := strings.TrimSpace(in.URL) != "" || strings.TrimSpace(in.Secret) != "" || strings.TrimSpace(in.ChatID) != "" || in.ThreadID != 0 || in.Type != current.Type
+	replace := strings.TrimSpace(in.URL) != "" || strings.TrimSpace(in.Secret) != "" || strings.TrimSpace(in.ChatID) != "" || in.ThreadID != 0 || strings.TrimSpace(in.ConversationID) != "" || in.AllowSharedConversation || in.Type != current.Type
 	if replace && !in.AllowDestinationChange {
 		return domain.Channel{}, errDestinationChange
 	}
@@ -231,8 +259,11 @@ func (s *Service) updateChannel(ctx context.Context, actor string, id shared.ID,
 	destination := current.Destination
 	recipients := current.Recipients
 	if replace {
-		config, dest, recips, e := validateChannel(in, true)
+		config, dest, recips, e := s.validateChannelInput(in, true)
 		if e != nil {
+			return domain.Channel{}, e
+		}
+		if config, e = s.verifiedDestination(ctx, in, config); e != nil {
 			return domain.Channel{}, e
 		}
 		sealed, e = s.seal(tenant, id, current.SecretVersion+1, config)
@@ -243,7 +274,7 @@ func (s *Service) updateChannel(ctx context.Context, actor string, id shared.ID,
 	} else {
 		in.Type = current.Type
 		if in.Type == domain.ChannelEmail && in.Recipients != nil {
-			_, _, recips, e := validateChannel(ChannelInput{Name: in.Name, Type: domain.ChannelEmail, Recipients: in.Recipients, Enabled: in.Enabled}, false)
+			_, _, recips, e := s.validateChannelInput(ChannelInput{Name: in.Name, Type: domain.ChannelEmail, Recipients: in.Recipients, Enabled: in.Enabled}, false)
 			if e != nil {
 				return domain.Channel{}, e
 			}
@@ -279,6 +310,11 @@ func (s *Service) updateChannel(ctx context.Context, actor string, id shared.ID,
 		}
 		if e = s.validateBinding(ctx, tenant, updated, rules); e != nil {
 			return domain.Channel{}, e
+		}
+	}
+	if updated.Type == domain.ChannelEmail {
+		if err = s.validateEmailRecipients(ctx, tenant, updated.Recipients); err != nil {
+			return domain.Channel{}, err
 		}
 	}
 	updated, err = s.repo.UpdateChannel(domain.WithActor(ctx, actor), updated, sealed, replace)
@@ -332,17 +368,20 @@ func (s *Service) ListChannels(ctx context.Context) ([]domain.Channel, error) {
 }
 
 type RuleInput struct {
-	Name            string           `json:"name"`
-	Enabled         bool             `json:"enabled"`
-	EventType       domain.EventType `json:"event_type"`
-	MinSeverity     shared.Severity  `json:"min_severity,omitempty"`
-	ActionTypes     []string         `json:"action_types,omitempty"`
-	EngagementIDs   []shared.ID      `json:"engagement_ids,omitempty"`
-	TeamIDs         []shared.ID      `json:"team_ids,omitempty"`
-	AllTeams        bool             `json:"all_teams,omitempty"`
-	ChannelIDs      []shared.ID      `json:"channel_ids"`
-	LeadTimeSeconds int64            `json:"lead_time_seconds,omitempty"`
-	Revision        int              `json:"revision,omitempty"`
+	Name          string           `json:"name"`
+	Enabled       bool             `json:"enabled"`
+	EventType     domain.EventType `json:"event_type"`
+	MinSeverity   shared.Severity  `json:"min_severity,omitempty"`
+	ActionTypes   []string         `json:"action_types,omitempty"`
+	EngagementIDs []shared.ID      `json:"engagement_ids,omitempty"`
+	TeamIDs       []shared.ID      `json:"team_ids,omitempty"`
+	AllTeams      bool             `json:"all_teams,omitempty"`
+	ChannelIDs    []shared.ID      `json:"channel_ids"`
+	// RecipientRoles address people by their relation to the event (#1415): assignee, team_member
+	// or engagement_lead.
+	RecipientRoles  []string `json:"recipient_roles,omitempty"`
+	LeadTimeSeconds int64    `json:"lead_time_seconds,omitempty"`
+	Revision        int      `json:"revision,omitempty"`
 }
 
 func (s *Service) createRule(ctx context.Context, actor string, in RuleInput) (domain.Rule, error) {
@@ -358,7 +397,7 @@ func (s *Service) createRule(ctx context.Context, actor string, in RuleInput) (d
 		return domain.Rule{}, fmt.Errorf("notification rule limit reached: %w", shared.ErrSaturated)
 	}
 	now := s.clock.Now().UTC()
-	r := domain.Rule{TenantID: tenant, ID: s.ids.NewID(), Name: in.Name, Enabled: in.Enabled, EventType: in.EventType, MinSeverity: in.MinSeverity, ActionTypes: in.ActionTypes, EngagementIDs: in.EngagementIDs, TeamIDs: in.TeamIDs, AllTeams: in.AllTeams, ChannelIDs: in.ChannelIDs, LeadTimeSecs: in.LeadTimeSeconds, Revision: 1, CreatedAt: now, UpdatedAt: now}
+	r := domain.Rule{TenantID: tenant, ID: s.ids.NewID(), Name: in.Name, Enabled: in.Enabled, EventType: in.EventType, MinSeverity: in.MinSeverity, ActionTypes: in.ActionTypes, EngagementIDs: in.EngagementIDs, TeamIDs: in.TeamIDs, AllTeams: in.AllTeams, ChannelIDs: in.ChannelIDs, RecipientRoles: in.RecipientRoles, LeadTimeSecs: in.LeadTimeSeconds, Revision: 1, CreatedAt: now, UpdatedAt: now}
 	if err = r.Normalize(); err != nil {
 		return domain.Rule{}, err
 	}
@@ -369,7 +408,7 @@ func (s *Service) createRule(ctx context.Context, actor string, in RuleInput) (d
 	if err != nil {
 		return domain.Rule{}, err
 	}
-	if err = s.record(ctx, actor, "notification.rule.created", r.ID.String(), map[string]string{"event_type": string(r.EventType)}); err != nil {
+	if err = s.record(ctx, actor, "notification.rule.created", r.ID.String(), map[string]string{"event_type": string(r.EventType), "recipient_roles": strings.Join(r.RecipientRoles, ",")}); err != nil {
 		return domain.Rule{}, err
 	}
 	return r, nil
@@ -386,7 +425,7 @@ func (s *Service) updateRule(ctx context.Context, actor string, id shared.ID, in
 	if current.Revision != in.Revision {
 		return domain.Rule{}, fmt.Errorf("notification rule revision is stale: %w", shared.ErrConflict)
 	}
-	r := domain.Rule{TenantID: tenant, ID: id, Name: in.Name, Enabled: in.Enabled, EventType: in.EventType, MinSeverity: in.MinSeverity, ActionTypes: in.ActionTypes, EngagementIDs: in.EngagementIDs, TeamIDs: in.TeamIDs, AllTeams: in.AllTeams, ChannelIDs: in.ChannelIDs, LeadTimeSecs: in.LeadTimeSeconds, Revision: current.Revision + 1, CreatedAt: current.CreatedAt, UpdatedAt: s.clock.Now().UTC()}
+	r := domain.Rule{TenantID: tenant, ID: id, Name: in.Name, Enabled: in.Enabled, EventType: in.EventType, MinSeverity: in.MinSeverity, ActionTypes: in.ActionTypes, EngagementIDs: in.EngagementIDs, TeamIDs: in.TeamIDs, AllTeams: in.AllTeams, ChannelIDs: in.ChannelIDs, RecipientRoles: in.RecipientRoles, LeadTimeSecs: in.LeadTimeSeconds, Revision: current.Revision + 1, CreatedAt: current.CreatedAt, UpdatedAt: s.clock.Now().UTC()}
 	if err = r.Normalize(); err != nil {
 		return domain.Rule{}, err
 	}
@@ -397,7 +436,7 @@ func (s *Service) updateRule(ctx context.Context, actor string, id shared.ID, in
 	if err != nil {
 		return domain.Rule{}, err
 	}
-	if err = s.record(ctx, actor, "notification.rule.updated", id.String(), nil); err != nil {
+	if err = s.record(ctx, actor, "notification.rule.updated", id.String(), map[string]string{"event_type": string(r.EventType), "recipient_roles": strings.Join(r.RecipientRoles, ",")}); err != nil {
 		return domain.Rule{}, err
 	}
 	return r, nil
@@ -438,6 +477,11 @@ func (s *Service) testChannel(ctx context.Context, actor string, cid shared.ID) 
 	}
 	if err = s.refuseDisabled(channel.Type); err != nil {
 		return "", err
+	}
+	if channel.Type == domain.ChannelEmail {
+		if err = s.validateEmailRecipients(ctx, tenant, channel.Recipients); err != nil {
+			return "", err
+		}
 	}
 	now := s.clock.Now().UTC()
 	data, _ := json.Marshal(map[string]any{"title": "Synapse notification test"})
@@ -683,6 +727,9 @@ func (s *Service) HandleJob(ctx context.Context, job ports.QueuedJob) error {
 		return err
 	}
 	work.Formatted, work.CustomWebhookBody, work.WebhookBody = render.Formatted, render.CustomBody, render.WebhookBody
+	if err := s.prepareSubjectThread(ctx, &work); err != nil {
+		return err
+	}
 	now := s.clock.Now().UTC()
 	aid := s.ids.NewID()
 	admission := ports.AttemptAdmission{TemplateRef: render.Message.TemplateRef, DataClass: render.Class,
@@ -695,7 +742,7 @@ func (s *Service) HandleJob(ctx context.Context, job ports.QueuedJob) error {
 	if err != nil {
 		finished := s.clock.Now().UTC()
 		// The vault key is the operator's, not the channel's, so this never counts towards a pause.
-		if finishErr := s.finishAttempt(ctx, attempt, finished, "failed", 0, "channel_secret_unavailable", nil, domain.AttemptIgnored); finishErr != nil {
+		if finishErr := s.finishAttempt(ctx, attempt, finished, "failed", 0, "channel_secret_unavailable", nil, "", work.Delivery.ProviderRequestRef, domain.AttemptIgnored); finishErr != nil {
 			return finishErr
 		}
 		s.observeAttempt(work.Delivery.ChannelType, now, finished, false, false)
@@ -705,18 +752,27 @@ func (s *Service) HandleJob(ctx context.Context, job ports.QueuedJob) error {
 	cfg, configErr := decodeChannelConfig(work.Channel.Type, raw)
 	if configErr != "" {
 		finished := s.clock.Now().UTC()
-		if finishErr := s.finishAttempt(ctx, attempt, finished, "failed", 0, configErr, nil, domain.ClassifyAttempt(false, configErr, false)); finishErr != nil {
+		if finishErr := s.finishAttempt(ctx, attempt, finished, "failed", 0, configErr, nil, "", work.Delivery.ProviderRequestRef, domain.ClassifyAttempt(false, configErr, false)); finishErr != nil {
 			return finishErr
 		}
 		s.observeAttempt(work.Delivery.ChannelType, now, finished, false, false)
 		s.observeDeadLetter(work.Delivery.ChannelType)
 		return &DeliveryError{terminal: true, cause: errors.New(configErr)}
 	}
-	result := s.sender.Send(ctx, work, cfg)
+	cfg, emailCode := s.EmailChannelConfig(ctx, work, cfg)
+	if work.Channel.Type == domain.ChannelJSM {
+		if _, ok := s.repo.(ports.NotificationProviderRequestFinisher); !ok {
+			emailCode = "provider_resume_unavailable"
+		}
+	}
+	result := ports.NotificationSendResult{ErrorCode: emailCode, Retryable: emailCode == "email_settings_unavailable", ProviderRequestRef: work.Delivery.ProviderRequestRef}
+	if emailCode == "" {
+		result = s.sender.Send(ctx, work, cfg)
+	}
 	result.TemplateFallback = result.TemplateFallback || render.Fallback
 	finished := s.clock.Now().UTC()
 	if result.ErrorCode == "" && result.StatusCode >= 200 && result.StatusCode < 300 {
-		if err = s.finishAttempt(ctx, attempt, finished, "delivered", result.StatusCode, "", nil, domain.AttemptDelivered); err != nil {
+		if err = s.finishAttempt(ctx, attempt, finished, "delivered", result.StatusCode, "", nil, result.RemoteRef, "", domain.AttemptDelivered); err != nil {
 			return err
 		}
 		s.observeAttempt(work.Delivery.ChannelType, now, finished, true, result.TemplateFallback)
@@ -743,7 +799,7 @@ func (s *Service) HandleJob(ctx context.Context, job ports.QueuedJob) error {
 	}
 	// The health class reads the sender's own Retryable flag, so a retry that finally exhausts
 	// its attempts (a 5xx eight times) still never counts towards a pause.
-	if err = s.finishAttempt(ctx, attempt, finished, outcome, result.StatusCode, code, nextPtr, domain.ClassifyAttempt(false, code, result.Retryable)); err != nil {
+	if err = s.finishAttempt(ctx, attempt, finished, outcome, result.StatusCode, code, nextPtr, "", result.ProviderRequestRef, domain.ClassifyAttempt(false, code, result.Retryable)); err != nil {
 		return err
 	}
 	s.observeAttempt(work.Delivery.ChannelType, now, finished, false, result.TemplateFallback)

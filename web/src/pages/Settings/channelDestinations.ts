@@ -8,8 +8,11 @@ import type { NotificationChannelType } from '../../lib/api'
 export interface ChannelDestinationSpec {
   /** Shown in the type select. */
   label: string
-  /** How the destination is entered: one URL, an email list, or a Telegram bot token and chat. */
-  kind: 'url' | 'signed_url' | 'recipients' | 'telegram'
+  /**
+   * How the destination is entered: one URL, an email list, a Telegram bot token and chat, or a
+   * Slack bot token and conversation.
+   */
+  kind: 'url' | 'signed_url' | 'recipients' | 'telegram' | 'slack_bot'
   urlLabel?: string
   placeholder?: string
   /** One sentence on where the administrator gets the value. */
@@ -56,6 +59,29 @@ export const CHANNEL_DESTINATIONS: Record<NotificationChannelType, ChannelDestin
     placeholder: 'https://discord.com/api/webhooks/…',
     hint: 'In the channel settings, open Integrations → Webhooks and copy the webhook URL. Messages never mention anyone.',
   },
+  mattermost: {
+    label: 'Mattermost', kind: 'url', urlLabel: 'Mattermost webhook URL',
+    hint: 'Paste the full incoming webhook URL. The operator must approve its host.',
+  },
+  rocket_chat: {
+    label: 'Rocket.Chat', kind: 'url', urlLabel: 'Rocket.Chat webhook URL',
+    hint: 'Paste the full incoming webhook URL. The operator must approve its host.',
+  },
+  pagerduty: {
+    label: 'PagerDuty', kind: 'signed_url', urlLabel: 'Events API endpoint',
+    placeholder: 'https://events.pagerduty.com/v2/enqueue',
+    hint: 'Use the US or EU Events API v2 endpoint and the integration routing key.',
+  },
+  jsm: {
+    label: 'Jira Service Management', kind: 'signed_url', urlLabel: 'Integration Events API endpoint',
+    placeholder: 'https://api.atlassian.com/jsm/ops/integration/v2/alerts',
+    hint: 'Use the JSM Operations integration API key. This is separate from an Atlassian API token.',
+  },
+  slack_bot: {
+    label: 'Slack app (bot token)',
+    kind: 'slack_bot',
+    hint: 'Create a Slack app with the chat:write, channels:read and groups:read bot scopes, install it, then enter its bot token (xoxb-…). Invite the app to a private channel before choosing it. Messages never unfurl links.',
+  },
 }
 
 export const CHANNEL_TYPE_ORDER: NotificationChannelType[] = [
@@ -66,6 +92,11 @@ export const CHANNEL_TYPE_ORDER: NotificationChannelType[] = [
   'telegram',
   'google_chat',
   'discord',
+  'mattermost',
+  'rocket_chat',
+  'pagerduty',
+  'jsm',
+  'slack_bot',
 ]
 
 /** The type's display name, or the raw type for one this console does not know. */
@@ -75,11 +106,16 @@ export function channelTypeLabel(type: string): string {
 
 /** The text that tells an editor what to re-enter to replace a channel's destination. */
 export function replaceDestinationHint(type: NotificationChannelType): string {
+  if (type === 'pagerduty' || type === 'jsm') {
+    return 'Leave endpoint and key blank to keep them. To change the destination, enter the endpoint and full key again.'
+  }
   switch (CHANNEL_DESTINATIONS[type].kind) {
     case 'signed_url':
       return 'Leave URL and secret blank to keep them. To replace a webhook destination, supply both a new URL and signing secret.'
     case 'telegram':
       return 'Leave the token and chat blank to keep them. To change the bot, chat or topic, enter the bot token and chat ID again.'
+    case 'slack_bot':
+      return 'Leave the token and conversation blank to keep them. To change the app, the conversation or whether shared conversations are allowed, enter the bot token and conversation ID again.'
     case 'recipients':
       return 'Changing the recipient list changes where this channel delivers.'
     default:
@@ -89,3 +125,9 @@ export function replaceDestinationHint(type: NotificationChannelType): string {
 
 /** Telegram chat IDs are numeric (groups and channels are negative) or an @channel username. */
 export const TELEGRAM_CHAT_PATTERN = /^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31})$/
+
+/** Slack conversation IDs a bot channel posts into: C… channels and older G… private channels. */
+export const SLACK_CONVERSATION_PATTERN = /^[CG][A-Z0-9]{8,20}$/
+
+/** A Slack bot token. User (xoxp-) and app-level (xapp-) tokens cannot post as the app. */
+export const SLACK_BOT_TOKEN_PATTERN = /^xoxb-[0-9A-Za-z-]{10,250}$/

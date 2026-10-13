@@ -65,13 +65,16 @@ type NotificationRepository struct {
 }
 
 var _ ports.NotificationRepository = (*NotificationRepository)(nil)
+var _ ports.NotificationSubjectAnchorReader = (*NotificationRepository)(nil)
+var _ ports.NotificationRemoteRefFinisher = (*NotificationRepository)(nil)
+var _ ports.NotificationProviderRequestFinisher = (*NotificationRepository)(nil)
 
 // Admission caps match postgres.notificationAdmission.
 const (
 	maxNotificationChannels   = 50
 	maxNotificationRules      = 200
 	maxOpenDeliveries         = 10000
-	maxChannelTestsPerMinute  = 10
+	maxChannelTestsPerHour    = 5
 	notificationDeliverJobKey = "notification.deliver"
 	// Delivery rate limits, as postgres.NotificationRepository.BeginAttempt applies them.
 	tenantAttemptInterval  = 100 * time.Millisecond
@@ -333,4 +336,19 @@ func staleRevision(kind string) error {
 func notificationStableID(parts ...string) shared.ID {
 	h := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return shared.ID(hex.EncodeToString(h[:16]))
+}
+
+// GetChannelSealedConfig implements ports.NotificationChannelSecretReader.
+func (r *NotificationRepository) GetChannelSealedConfig(_ context.Context, tenant, id shared.ID) (notification.Channel, string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c, ok := r.channels[notificationKey{tenant, id}]
+	if !ok || c.DeletedAt != nil {
+		return notification.Channel{}, "", fmt.Errorf("notification channel %s: %w", id, shared.ErrNotFound)
+	}
+	sealed, ok := r.versions[channelVersionKey{tenant, id, c.SecretVersion}]
+	if !ok {
+		return notification.Channel{}, "", fmt.Errorf("notification channel %s version: %w", id, shared.ErrNotFound)
+	}
+	return cloneChannel(c), sealed, nil
 }

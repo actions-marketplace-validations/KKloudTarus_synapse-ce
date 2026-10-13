@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -243,14 +244,16 @@ type Config struct {
 	NotificationEnabled bool
 	// InboundWebhooksEnabled mounts a separate authenticated ingress plane; off by default.
 	// PostgreSQL, a durable vault key, and an RLS-enforcing runtime role are mandatory.
-	InboundWebhooksEnabled     bool
-	OwnershipMode              string // off (default), observe, enforce; PostgreSQL only
-	NotificationSMTPHost       string
-	NotificationSMTPPort       int
-	NotificationSMTPFrom       string
-	NotificationSMTPUsername   string
-	NotificationSMTPPassword   string
-	NotificationSMTPRequireTLS bool
+	InboundWebhooksEnabled       bool
+	OwnershipMode                string // off (default), observe, enforce; PostgreSQL only
+	NotificationSMTPHost         string
+	NotificationSMTPPort         int
+	NotificationSMTPFrom         string
+	NotificationSMTPUsername     string
+	NotificationSMTPPassword     string
+	NotificationSMTPRequireTLS   bool
+	NotificationSMTPAllowedHosts []string
+	NotificationChatAllowedHosts []string
 	// NotificationUnsubscribeURL is an operator-owned receiver endpoint for tenant-channel email.
 	// It must remove the recipient using receiver-side state; Synapse never interpolates a recipient.
 	NotificationUnsubscribeURL string
@@ -259,6 +262,11 @@ type Config struct {
 	// test or deliver to. Parsed trimmed, lowercased and deduplicated; the API and the worker check
 	// each name against the notification driver registry at startup.
 	NotificationProvidersDisabled []string
+	// TeamsBotAppID, TeamsBotAppPassword and TeamsBotTenantID register the operator's Microsoft Teams
+	// bot for personal delivery (#1420). The password is secret. All empty leaves Teams off.
+	TeamsBotAppID       string
+	TeamsBotAppPassword string
+	TeamsBotTenantID    string
 	// NotificationChannelPauseThreshold is how many consecutive permanent delivery failures pause
 	// a notification channel (#1464). Zero keeps counting but never pauses. Read by the worker.
 	NotificationChannelPauseThreshold int
@@ -950,40 +958,45 @@ func Load() Config {
 
 		NotificationProvidersDisabled: parseLowerSet(getenv("SYNAPSE_NOTIFICATION_PROVIDERS_DISABLED", "")),
 
-		EvidenceSigningSeed:        getenv("SYNAPSE_EVIDENCE_SIGNING_SEED", ""),
-		TSAURL:                     getenv("SYNAPSE_TSA_URL", ""),
-		SandboxEnabled:             getbool("SYNAPSE_SANDBOX_ENABLED", false),
-		SandboxMemMax:              int64(getint("SYNAPSE_SANDBOX_MEM_MAX", 512<<20)),
-		SandboxPidsMax:             getint("SYNAPSE_SANDBOX_PIDS_MAX", 256),
-		DASTHelperBin:              getenv("SYNAPSE_DAST_HELPER_BIN", "synapse-dast-helper"),
-		DASTMaxReauth:              maxReauth,
-		DASTRatePerSec:             ratePerSec,
-		DASTConcurrency:            concurrency,
-		DASTMaxDepth:               maxDepth,
-		DASTMaxPages:               maxPages,
-		DASTMaxRequests:            maxRequests,
-		DASTMaxWallClock:           maxWallClock,
-		VaultMasterKey:             getenv("SYNAPSE_VAULT_MASTER_KEY", ""),
-		NotificationEnabled:        getbool("SYNAPSE_NOTIFICATIONS_ENABLED", false),
-		InboundWebhooksEnabled:     getbool("SYNAPSE_INBOUND_WEBHOOKS_ENABLED", false),
-		OwnershipMode:              getenv("SYNAPSE_OWNERSHIP_MODE", "off"),
-		NotificationSMTPHost:       getenv("SYNAPSE_NOTIFICATION_SMTP_HOST", ""),
-		NotificationSMTPPort:       getint("SYNAPSE_NOTIFICATION_SMTP_PORT", 587),
-		NotificationSMTPFrom:       getenv("SYNAPSE_NOTIFICATION_SMTP_FROM", ""),
-		NotificationSMTPUsername:   getenv("SYNAPSE_NOTIFICATION_SMTP_USERNAME", ""),
-		NotificationSMTPPassword:   getenv("SYNAPSE_NOTIFICATION_SMTP_PASSWORD", ""),
-		NotificationSMTPRequireTLS: getbool("SYNAPSE_NOTIFICATION_SMTP_REQUIRE_TLS", true),
-		NotificationUnsubscribeURL: getenv("SYNAPSE_NOTIFICATION_UNSUBSCRIBE_URL", ""),
-		ReconViaWorker:             getbool("SYNAPSE_RECON_VIA_WORKER", false),
-		EgressBrokerSocket:         getenv("SYNAPSE_EGRESS_BROKER_SOCKET", "/run/synapse-egress-broker/egress-broker.sock"),
-		EgressGrantAuthorityAddr:   getenv("SYNAPSE_EGRESS_GRANT_AUTHORITY_ADDR", ""),
-		EgressGrantAuthorityURL:    getenv("SYNAPSE_EGRESS_GRANT_AUTHORITY_URL", ""),
-		EgressGrantAuthorityToken:  getenv("SYNAPSE_EGRESS_GRANT_AUTHORITY_TOKEN", ""),
-		EgressGrantIssuerToken:     getenv("SYNAPSE_EGRESS_GRANT_ISSUER_TOKEN", ""),
-		EgressGrantSigningSeed:     getenv("SYNAPSE_EGRESS_GRANT_SIGNING_SEED", ""),
-		ToolExecutionMode:          getenv("SYNAPSE_TOOL_EXECUTION_MODE", ""),
-		ToolHashes:                 parsePins(getenv("SYNAPSE_TOOL_HASHES", "")),
-		AgentEnabled:               getbool("SYNAPSE_AGENT_ENABLED", false), // needs LLM creds → stays opt-in
+		EvidenceSigningSeed:          getenv("SYNAPSE_EVIDENCE_SIGNING_SEED", ""),
+		TSAURL:                       getenv("SYNAPSE_TSA_URL", ""),
+		SandboxEnabled:               getbool("SYNAPSE_SANDBOX_ENABLED", false),
+		SandboxMemMax:                int64(getint("SYNAPSE_SANDBOX_MEM_MAX", 512<<20)),
+		SandboxPidsMax:               getint("SYNAPSE_SANDBOX_PIDS_MAX", 256),
+		DASTHelperBin:                getenv("SYNAPSE_DAST_HELPER_BIN", "synapse-dast-helper"),
+		DASTMaxReauth:                maxReauth,
+		DASTRatePerSec:               ratePerSec,
+		DASTConcurrency:              concurrency,
+		DASTMaxDepth:                 maxDepth,
+		DASTMaxPages:                 maxPages,
+		DASTMaxRequests:              maxRequests,
+		DASTMaxWallClock:             maxWallClock,
+		VaultMasterKey:               getenv("SYNAPSE_VAULT_MASTER_KEY", ""),
+		NotificationEnabled:          getbool("SYNAPSE_NOTIFICATIONS_ENABLED", false),
+		InboundWebhooksEnabled:       getbool("SYNAPSE_INBOUND_WEBHOOKS_ENABLED", false),
+		OwnershipMode:                getenv("SYNAPSE_OWNERSHIP_MODE", "off"),
+		NotificationSMTPHost:         getenv("SYNAPSE_NOTIFICATION_SMTP_HOST", ""),
+		NotificationSMTPPort:         getint("SYNAPSE_NOTIFICATION_SMTP_PORT", 587),
+		NotificationSMTPFrom:         getenv("SYNAPSE_NOTIFICATION_SMTP_FROM", ""),
+		NotificationSMTPUsername:     getenv("SYNAPSE_NOTIFICATION_SMTP_USERNAME", ""),
+		NotificationSMTPPassword:     getenv("SYNAPSE_NOTIFICATION_SMTP_PASSWORD", ""),
+		NotificationSMTPRequireTLS:   getbool("SYNAPSE_NOTIFICATION_SMTP_REQUIRE_TLS", true),
+		NotificationSMTPAllowedHosts: parseLowerSet(getenv("SYNAPSE_NOTIFICATION_SMTP_ALLOWED_HOSTS", "")),
+		NotificationChatAllowedHosts: parseLowerSet(getenv("SYNAPSE_NOTIFICATION_CHAT_ALLOWED_HOSTS", "")),
+		TeamsBotAppID:                strings.TrimSpace(getenv("SYNAPSE_TEAMS_BOT_APP_ID", "")),
+		TeamsBotAppPassword:          getenv("SYNAPSE_TEAMS_BOT_APP_PASSWORD", ""),
+		TeamsBotTenantID:             strings.TrimSpace(getenv("SYNAPSE_TEAMS_BOT_TENANT_ID", "")),
+		NotificationUnsubscribeURL:   getenv("SYNAPSE_NOTIFICATION_UNSUBSCRIBE_URL", ""),
+		ReconViaWorker:               getbool("SYNAPSE_RECON_VIA_WORKER", false),
+		EgressBrokerSocket:           getenv("SYNAPSE_EGRESS_BROKER_SOCKET", "/run/synapse-egress-broker/egress-broker.sock"),
+		EgressGrantAuthorityAddr:     getenv("SYNAPSE_EGRESS_GRANT_AUTHORITY_ADDR", ""),
+		EgressGrantAuthorityURL:      getenv("SYNAPSE_EGRESS_GRANT_AUTHORITY_URL", ""),
+		EgressGrantAuthorityToken:    getenv("SYNAPSE_EGRESS_GRANT_AUTHORITY_TOKEN", ""),
+		EgressGrantIssuerToken:       getenv("SYNAPSE_EGRESS_GRANT_ISSUER_TOKEN", ""),
+		EgressGrantSigningSeed:       getenv("SYNAPSE_EGRESS_GRANT_SIGNING_SEED", ""),
+		ToolExecutionMode:            getenv("SYNAPSE_TOOL_EXECUTION_MODE", ""),
+		ToolHashes:                   parsePins(getenv("SYNAPSE_TOOL_HASHES", "")),
+		AgentEnabled:                 getbool("SYNAPSE_AGENT_ENABLED", false), // needs LLM creds → stays opt-in
 		// Analysis capabilities default ON so the tool is fully effective out of the box (the UI and a
 		// bare scan get every deterministic, best-effort feature without hunting env flags). Each is
 		// safe to default on: file/compute-based, no external service, and a no-op when its input is
@@ -2035,4 +2048,30 @@ func getint64(key string, def int64) int64 {
 		}
 	}
 	return def
+}
+
+var teamsBotGUID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// TeamsBotEnabled reports whether the operator registered a Microsoft Teams bot (#1420).
+func (c Config) TeamsBotEnabled() bool { return c.TeamsBotAppID != "" }
+
+// ValidateTeamsBot checks the Teams bot registration: the app ID is a GUID, the password is set
+// with it, and the tenant, when given, is a GUID. Errors never echo the password.
+func (c Config) ValidateTeamsBot() error {
+	if c.TeamsBotAppID == "" {
+		if c.TeamsBotAppPassword != "" || c.TeamsBotTenantID != "" {
+			return fmt.Errorf("SYNAPSE_TEAMS_BOT_APP_ID is required when the Teams bot password or tenant is set")
+		}
+		return nil
+	}
+	if !teamsBotGUID.MatchString(c.TeamsBotAppID) {
+		return fmt.Errorf("SYNAPSE_TEAMS_BOT_APP_ID must be the bot's Microsoft app ID (a GUID)")
+	}
+	if c.TeamsBotAppPassword == "" {
+		return fmt.Errorf("SYNAPSE_TEAMS_BOT_APP_PASSWORD is required with SYNAPSE_TEAMS_BOT_APP_ID")
+	}
+	if c.TeamsBotTenantID != "" && !teamsBotGUID.MatchString(c.TeamsBotTenantID) {
+		return fmt.Errorf("SYNAPSE_TEAMS_BOT_TENANT_ID must be a Microsoft Entra tenant ID (a GUID)")
+	}
+	return nil
 }

@@ -22,11 +22,18 @@ const (
 	ChannelTelegram   ChannelType = "telegram"
 	ChannelGoogleChat ChannelType = "google_chat"
 	ChannelDiscord    ChannelType = "discord"
+	ChannelMattermost ChannelType = "mattermost"
+	ChannelRocketChat ChannelType = "rocket_chat"
+	ChannelPagerDuty  ChannelType = "pagerduty"
+	ChannelJSM        ChannelType = "jsm"
+	// ChannelSlackBot posts as a Slack app with a bot token through chat.postMessage (#1383),
+	// unlike ChannelSlack, which posts to an incoming webhook.
+	ChannelSlackBot ChannelType = "slack_bot"
 )
 
 func (v ChannelType) Valid() bool {
 	switch v {
-	case ChannelWebhook, ChannelSlack, ChannelEmail, ChannelTeams, ChannelTelegram, ChannelGoogleChat, ChannelDiscord:
+	case ChannelWebhook, ChannelSlack, ChannelEmail, ChannelTeams, ChannelTelegram, ChannelGoogleChat, ChannelDiscord, ChannelMattermost, ChannelRocketChat, ChannelPagerDuty, ChannelJSM, ChannelSlackBot:
 		return true
 	}
 	return false
@@ -138,8 +145,11 @@ type Rule struct {
 	TeamIDs       []shared.ID     `json:"team_ids,omitempty"`
 	AllTeams      bool            `json:"all_teams,omitempty"`
 	ChannelIDs    []shared.ID     `json:"channel_ids"`
-	LeadTime      time.Duration   `json:"-"`
-	LeadTimeSecs  int64           `json:"lead_time_seconds,omitempty"`
+	// RecipientRoles address people by their relation to the event (#1415), in addition to the
+	// channels. A rule may have roles and no channel.
+	RecipientRoles []string      `json:"recipient_roles,omitempty"`
+	LeadTime       time.Duration `json:"-"`
+	LeadTimeSecs   int64         `json:"lead_time_seconds,omitempty"`
 	// DisabledReason explains a rule the system disabled; any save by an administrator clears it.
 	DisabledReason string    `json:"disabled_reason,omitempty"`
 	Revision       int       `json:"revision"`
@@ -164,7 +174,7 @@ func (r *Rule) Normalize() error {
 		r.LeadTime = 24 * time.Hour
 	}
 	r.LeadTimeSecs = int64(r.LeadTime / time.Second)
-	if r.TenantID.IsZero() || r.ID.IsZero() || r.Name == "" || !known || spec.OperatorOnly || len(r.ChannelIDs) == 0 || r.Revision < 1 || r.CreatedAt.IsZero() || r.UpdatedAt.IsZero() {
+	if r.TenantID.IsZero() || r.ID.IsZero() || r.Name == "" || !known || spec.OperatorOnly || r.Revision < 1 || r.CreatedAt.IsZero() || r.UpdatedAt.IsZero() {
 		return fmt.Errorf("%w: invalid notification rule", shared.ErrValidation)
 	}
 	if r.MinSeverity != "" && shared.SeverityRank(r.MinSeverity) == 0 {
@@ -196,7 +206,13 @@ func (r *Rule) Normalize() error {
 	if err := r.normalizeTeamScope(spec); err != nil {
 		return err
 	}
-	if len(r.ChannelIDs) == 0 || len(r.ChannelIDs) > 50 || len(r.EngagementIDs) > 200 || len(r.Name) > 200 {
+	if err := r.normalizeRecipientRoles(); err != nil {
+		return err
+	}
+	if len(r.ChannelIDs) == 0 && len(r.RecipientRoles) == 0 {
+		return fmt.Errorf("%w: a rule needs a channel or a recipient role", shared.ErrValidation)
+	}
+	if len(r.ChannelIDs) > 50 || len(r.EngagementIDs) > 200 || len(r.Name) > 200 {
 		return fmt.Errorf("%w: invalid rule bounds", shared.ErrValidation)
 	}
 	return nil
@@ -304,6 +320,12 @@ type Delivery struct {
 	UpdatedAt      time.Time     `json:"updated_at"`
 	// TemplateRef is the template pinned by the first attempt (#1365); retries render with it.
 	TemplateRef string `json:"template_ref,omitempty"`
+	// RemoteRef is the acknowledged provider message handle. It is used only to
+	// anchor later deliveries of the same subject to this channel configuration.
+	RemoteRef string `json:"remote_ref,omitempty"`
+	// ProviderRequestRef resumes an accepted asynchronous operation. It is not an
+	// acknowledgement or subject anchor and is never exposed through delivery APIs.
+	ProviderRequestRef string `json:"-"`
 }
 
 type Attempt struct {
