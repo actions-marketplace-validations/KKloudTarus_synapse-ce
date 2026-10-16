@@ -80,7 +80,10 @@ func TestPostgresScanSourceJobRoundTripAndStatusUpdates(t *testing.T) {
 			if len(jobs) != 1 {
 				t.Fatalf("stale running count = %d, want 1", len(jobs))
 			}
-			return jobs[0], nil
+			if jobs[0].TenantID != item.TenantID {
+				t.Fatalf("stale job tenant = %q, want %q", jobs[0].TenantID, item.TenantID)
+			}
+			return jobs[0].Job, nil
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -112,13 +115,14 @@ func TestPostgresScanSourceJobRoundTripAndStatusUpdates(t *testing.T) {
 		t.Fatalf("failed job did not retain its source: %v", err)
 	}
 
-	// Even a valid package owned by another assessment cannot rewrite an
+	// A package owned by another assessment is refused without rewriting the
 	// existing job through the status upsert path.
 	_, other := scanSourceFixture(t, ctx, pool, item.TenantID, "other-assessment")
 	changed := scanSourceJob(other, job.ID)
 	changed.Status = ports.ScanFailed
-	if err := store.Save(ctx, changed); err != nil {
-		t.Fatalf("status-only upsert with another source: %v", err)
+	changed.FinishedAt = &finished
+	if err := store.Save(ctx, changed); !errors.Is(err, shared.ErrValidation) {
+		t.Fatalf("status-only upsert with another assessment: %v, want validation", err)
 	}
 	got, err = store.GetJob(ctx, job.ID)
 	if err != nil {
@@ -354,6 +358,8 @@ func TestPostgresScanSourceDoesNotReconstructUnboundHistory(t *testing.T) {
 				t.Fatalf("existing target kind no longer admitted: %v", err)
 			}
 			job.Status = ports.ScanFailed
+			finished := time.Now().UTC().Truncate(time.Microsecond)
+			job.FinishedAt = &finished
 			if err := jobs.Save(ctx, job); err != nil {
 				t.Fatalf("unbound status transition failed: %v", err)
 			}

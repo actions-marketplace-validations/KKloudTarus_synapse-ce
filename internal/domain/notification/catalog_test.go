@@ -19,11 +19,19 @@ func TestCatalogIsConsistent(t *testing.T) {
 		}
 		// A filter is only declared when the producer fills the field it reads.
 		requires := map[Filter]bool{
-			FilterEngagements: spec.HasEngagement,
-			FilterMinSeverity: spec.HasSeverity,
-			FilterTeams:       spec.HasTeam,
-			FilterLeadTime:    spec.HasLeadTime,
-			FilterActionTypes: spec.Type == EventVulnerabilityAction,
+			FilterEngagements:   spec.HasEngagement,
+			FilterMinSeverity:   spec.HasSeverity,
+			FilterTeams:         spec.HasTeam,
+			FilterLeadTime:      spec.HasLeadTime,
+			FilterActionTypes:   spec.Type == EventVulnerabilityAction,
+			FilterKinds:         spec.Type == EventApprovalRequested || spec.Type == EventApprovalDecided || spec.Type == EventApprovalTimedOut,
+			FilterFindingKinds:  spec.Type == EventFindingCreated || spec.Type == EventFindingStatusChanged || spec.Type == EventFindingRetestCompleted,
+			FilterFromStatuses:  spec.Type == EventFindingStatusChanged,
+			FilterToStatuses:    spec.Type == EventFindingStatusChanged,
+			FilterRetestResults: spec.Type == EventFindingRetestCompleted,
+			FilterScanKinds:     spec.Type == EventScanFailed || spec.Type == EventDASTRunFinished || spec.Type == EventReconRunFinished,
+			FilterOutcomes:      spec.Type == EventScanFailed || spec.Type == EventDASTRunFinished || spec.Type == EventReconRunFinished || spec.Type == EventCSPMRunFinished || spec.Type == EventResponseFinished,
+			FilterProviders:     spec.Type == EventScanFailed || spec.Type == EventDASTRunFinished || spec.Type == EventReconRunFinished || spec.Type == EventCSPMRunFinished,
 		}
 		for _, filter := range spec.Filters {
 			if !requires[filter] {

@@ -24,6 +24,13 @@ var builderFixtures = []domain.EventType{
 	domain.EventVulnerabilityAction, domain.EventScanCompleted, domain.EventQualityGateFailed, domain.EventSLAApproaching,
 	domain.EventFleetAgentOffline, domain.EventIncidentCreated, domain.EventOwnershipChanged,
 	domain.EventChannelPaused, domain.EventDestinationChanged, domain.EventTest,
+	domain.EventFindingCreated, domain.EventFindingStatusChanged, domain.EventFindingRetestCompleted,
+	domain.EventScanFailed, domain.EventDASTRunFinished, domain.EventReconRunFinished, domain.EventCSPMRunFinished,
+	domain.EventSLABreached, domain.EventRiskAcceptanceCreated, domain.EventRiskAcceptanceExpiring, domain.EventRiskAcceptanceExpired,
+	domain.EventEngagementCreated, domain.EventEngagementStatusChanged, domain.EventEngagementWindowStarting, domain.EventEngagementWindowEnding,
+	domain.EventFindingCommented, domain.EventFindingMentioned,
+	domain.EventApprovalRequested, domain.EventApprovalDecided, domain.EventApprovalTimedOut,
+	domain.EventIncidentUpdated, domain.EventResponseFinished, domain.EventEvidenceChainBroken,
 }
 
 func fixtureEvent(t *testing.T, eventType domain.EventType) domain.Event {
@@ -164,12 +171,83 @@ func TestProjectKeepsAProducerSubject(t *testing.T) {
 	}
 }
 
+func TestRemainingEventBuildersReadImmutableFacts(t *testing.T) {
+	builders := NewEventBuilders()
+	cases := []struct {
+		event domain.EventType
+		want  map[string]string
+	}{
+		{domain.EventEngagementStatusChanged, map[string]string{"from_status": "planned", "to_status": "active", "engagement_name": "October assessment"}},
+		{domain.EventEngagementWindowStarting, map[string]string{"boundary": "authorized_from", "lead_time_hours": "24"}},
+		{domain.EventFindingCommented, map[string]string{"actor": "analyst-42", "comment_excerpt": "Please validate the affected endpoint."}},
+		{domain.EventFindingMentioned, map[string]string{"status": "triage"}},
+		{domain.EventApprovalDecided, map[string]string{"kind": "response", "decision": "approved", "expires_at": "2026-10-15T08:00:00Z"}},
+		{domain.EventIncidentUpdated, map[string]string{"update_kind": "status", "incident_title": "Suspicious network activity"}},
+		{domain.EventResponseFinished, map[string]string{"outcome": "verified", "action_kind": "isolate_host"}},
+		{domain.EventEvidenceChainBroken, map[string]string{"reason_code": "head_mismatch", "engagement_name": "October assessment"}},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.event), func(t *testing.T) {
+			e := fixtureEvent(t, tc.event)
+			projected, err := builders.Project(context.Background(), e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := domain.DecodeTemplateContext(projected.Context)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, want := range tc.want {
+				if got := snapshot.Vars[name]; got != want {
+					t.Errorf("%s = %q, want %q", name, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestFindingCommentBuilderCapsExcerptInTheSnapshot(t *testing.T) {
+	e := fixtureEvent(t, domain.EventFindingCommented)
+	var data map[string]any
+	if err := json.Unmarshal(e.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	data["comment_excerpt"] = strings.Repeat("é", 600)
+	e.Data, _ = json.Marshal(data)
+	projected, err := NewEventBuilders().Project(context.Background(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _ := domain.DecodeTemplateContext(projected.Context)
+	if got := len([]rune(snapshot.Vars["comment_excerpt"])); got != 500 {
+		t.Fatalf("comment excerpt has %d runes, want 500", got)
+	}
+}
+
 type recordedFacts struct {
 	answer   bool
 	scan     string
 	reminder ports.SLAReminder
 	agent    string
 	lastSeen time.Time
+}
+
+type lifecycleFacts struct {
+	recordedFacts
+	slaCurrent  bool
+	riskCurrent bool
+	slaCalls    int
+	riskCalls   int
+}
+
+func (f *lifecycleFacts) SLABreachCurrent(_ context.Context, _ shared.ID, _, _ string, _ time.Time, _ int) (bool, error) {
+	f.slaCalls++
+	return f.slaCurrent, nil
+}
+
+func (f *lifecycleFacts) RiskAcceptanceCurrent(_ context.Context, _ shared.ID, _, _ string, _ int, _ time.Time, _ bool) (bool, error) {
+	f.riskCalls++
+	return f.riskCurrent, nil
 }
 
 func (f *recordedFacts) ScanJobSucceeded(_ context.Context, _ shared.ID, scan string) (bool, error) {
@@ -230,5 +308,39 @@ func TestStillRelevantAsksTheSourceFact(t *testing.T) {
 	broken.Data = json.RawMessage(`{"title":"x"}`)
 	if _, err := builders.StillRelevant(context.Background(), &recordedFacts{}, ports.NotificationWork{Event: broken}); !errors.Is(err, shared.ErrValidation) {
 		t.Fatalf("an SLA event without a deadline = %v, want ErrValidation", err)
+	}
+}
+
+func TestLifecycleAlertsCancelWhenTheirCurrentStateNoLongerApplies(t *testing.T) {
+	builders := NewEventBuilders()
+	for _, eventType := range []domain.EventType{domain.EventSLABreached, domain.EventRiskAcceptanceExpiring, domain.EventRiskAcceptanceExpired} {
+		t.Run(string(eventType), func(t *testing.T) {
+			event := fixtureEvent(t, eventType)
+			facts := &lifecycleFacts{}
+			relevant, err := builders.StillRelevant(context.Background(), facts, ports.NotificationWork{Event: event})
+			if err != nil || relevant {
+				t.Fatalf("relevance = %v, %v; want cancelled", relevant, err)
+			}
+			if eventType == domain.EventSLABreached && facts.slaCalls != 1 {
+				t.Fatalf("SLA relevance calls = %d", facts.slaCalls)
+			}
+			if eventType != domain.EventSLABreached && facts.riskCalls != 1 {
+				t.Fatalf("risk relevance calls = %d", facts.riskCalls)
+			}
+		})
+	}
+}
+
+func TestLifecycleRelevanceFailsClosedWithoutCurrentStateReader(t *testing.T) {
+	_, err := NewEventBuilders().StillRelevant(context.Background(), &recordedFacts{}, ports.NotificationWork{Event: fixtureEvent(t, domain.EventSLABreached)})
+	if !errors.Is(err, shared.ErrValidation) {
+		t.Fatalf("missing lifecycle reader = %v, want validation error", err)
+	}
+}
+
+func TestRiskAcceptanceCreatedStaysRelevantAsHistoricalRecord(t *testing.T) {
+	relevant, err := NewEventBuilders().StillRelevant(context.Background(), &recordedFacts{}, ports.NotificationWork{Event: fixtureEvent(t, domain.EventRiskAcceptanceCreated)})
+	if err != nil || !relevant {
+		t.Fatalf("created acceptance relevance = %v, %v", relevant, err)
 	}
 }

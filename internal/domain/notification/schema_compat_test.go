@@ -26,6 +26,29 @@ var v1DataFields = map[EventType]string{
 	"notification.destination_changed": "title summary actor action class scheme host",
 	"notification.channel_paused":      "title summary channel_id class reason failure_code",
 	"notification.test":                "title",
+	"finding.created":                  "title summary finding_id engagement_id finding_kind status finding_version",
+	"finding.status_changed":           "title summary finding_id engagement_id finding_kind from_status to_status finding_version",
+	"finding.retest_completed":         "title summary finding_id engagement_id finding_kind retest_id result status finding_version",
+	"scan.failed":                      "title summary scan_id engagement_id scan_kind outcome provider providers counts_available severity_counts_available error_code",
+	"dast.run_finished":                "title summary run_id engagement_id scan_kind outcome provider providers counts_available severity_counts_available",
+	"recon.run_finished":               "title summary run_id engagement_id scan_kind outcome provider providers counts_available severity_counts_available",
+	"cspm.run_finished":                "title summary run_id engagement_id scan_kind outcome provider providers counts_available severity_counts_available",
+	"sla.breached":                     "title summary finding_id engagement_id assessment_id deadline breached_at tier",
+	"risk_acceptance.created":          "title summary finding_id engagement_id assessment_id acceptance_id acceptance_version accepted_at expires_at tier",
+	"risk_acceptance.expiring":         "title summary finding_id engagement_id assessment_id acceptance_id acceptance_version expires_at reminder lead_time_seconds tier",
+	"risk_acceptance.expired":          "title summary finding_id engagement_id assessment_id acceptance_id acceptance_version expires_at tier",
+	"engagement.created":               "title summary engagement_id",
+	"engagement.status_changed":        "title summary engagement_id",
+	"engagement.window_starting":       "title summary engagement_id authorized_from boundary lead_time_seconds",
+	"engagement.window_ending":         "title summary engagement_id authorized_to boundary lead_time_seconds",
+	"finding.commented":                "title summary finding_id engagement_id comment_id",
+	"finding.mentioned":                "title summary finding_id engagement_id comment_id mentioned_user_id",
+	"approval.requested":               "title summary approval_id engagement_id kind status",
+	"approval.decided":                 "title summary approval_id engagement_id kind status",
+	"approval.timed_out":               "title summary approval_id engagement_id kind status",
+	"incident.updated":                 "title summary incident_id engagement_id update_kind",
+	"response.finished":                "title summary response_id engagement_id outcome action_kind",
+	"evidence.chain_broken":            "title summary engagement_id evidence_chain_id reason_code",
 }
 
 func equalFieldSet(a, b []string) bool {
@@ -107,13 +130,19 @@ func TestPublishedV1ContractCompatibility(t *testing.T) {
 				}
 				sort.Strings(types)
 				wantType := "string"
-				if field == "lead_time_seconds" {
+				if field == "lead_time_seconds" || field == "finding_version" || field == "total_count" || field == "critical_count" || field == "high_count" || field == "medium_count" || field == "low_count" || field == "info_count" || field == "acceptance_version" {
 					wantType = "integer"
+				}
+				if field == "counts_available" || field == "severity_counts_available" {
+					wantType = "boolean"
+				}
+				if field == "providers" {
+					wantType = "array"
 				}
 				if strings.Join(types, "|") != wantType {
 					t.Errorf("v1 field %s changed type: %v, expected %s", field, types, wantType)
 				}
-				if field == "deadline" || field == "last_seen_at" {
+				if field == "deadline" || field == "breached_at" || field == "last_seen_at" {
 					if item["format"] != "date-time" {
 						t.Errorf("v1 %s lost date-time format", field)
 					}
@@ -228,6 +257,29 @@ func TestPublishedV1FieldConstraints(t *testing.T) {
 		"notification.destination_changed": "",
 		"notification.channel_paused":      "",
 		"notification.test":                "",
+		"finding.created":                  "engagement_id",
+		"finding.status_changed":           "engagement_id",
+		"finding.retest_completed":         "engagement_id",
+		"scan.failed":                      "engagement_id",
+		"dast.run_finished":                "engagement_id",
+		"recon.run_finished":               "engagement_id",
+		"cspm.run_finished":                "engagement_id",
+		"sla.breached":                     "engagement_id",
+		"risk_acceptance.created":          "engagement_id",
+		"risk_acceptance.expiring":         "engagement_id",
+		"risk_acceptance.expired":          "engagement_id",
+		"engagement.created":               "engagement_id",
+		"engagement.status_changed":        "engagement_id",
+		"engagement.window_starting":       "engagement_id",
+		"engagement.window_ending":         "engagement_id",
+		"finding.commented":                "engagement_id severity",
+		"finding.mentioned":                "engagement_id severity",
+		"approval.requested":               "engagement_id",
+		"approval.decided":                 "engagement_id",
+		"approval.timed_out":               "engagement_id",
+		"incident.updated":                 "engagement_id severity",
+		"response.finished":                "engagement_id",
+		"evidence.chain_broken":            "engagement_id severity",
 	}
 	closedEnums := map[EventType]map[string]string{
 		"vulnerability_action.created":     {"action_type": strings.Join(ActionTypes(), " ")},
@@ -244,6 +296,29 @@ func TestPublishedV1FieldConstraints(t *testing.T) {
 		"finding.ownership_changed":        "decision_id finding_id engagement_id",
 		"notification.destination_changed": "host",
 		"notification.channel_paused":      "channel_id class failure_code",
+		"finding.created":                  "finding_id engagement_id finding_kind",
+		"finding.status_changed":           "finding_id engagement_id finding_kind",
+		"finding.retest_completed":         "finding_id engagement_id finding_kind retest_id",
+		"scan.failed":                      "scan_id scan_kind provider error_code",
+		"dast.run_finished":                "run_id provider",
+		"recon.run_finished":               "run_id provider",
+		"cspm.run_finished":                "run_id provider",
+		"sla.breached":                     "finding_id engagement_id assessment_id",
+		"risk_acceptance.created":          "finding_id engagement_id assessment_id acceptance_id",
+		"risk_acceptance.expiring":         "finding_id engagement_id assessment_id acceptance_id",
+		"risk_acceptance.expired":          "finding_id engagement_id assessment_id acceptance_id",
+		"engagement.created":               "engagement_id",
+		"engagement.status_changed":        "engagement_id",
+		"engagement.window_starting":       "engagement_id",
+		"engagement.window_ending":         "engagement_id",
+		"finding.commented":                "finding_id engagement_id comment_id",
+		"finding.mentioned":                "finding_id engagement_id comment_id mentioned_user_id",
+		"approval.requested":               "approval_id engagement_id",
+		"approval.decided":                 "approval_id engagement_id",
+		"approval.timed_out":               "approval_id engagement_id",
+		"incident.updated":                 "incident_id engagement_id",
+		"response.finished":                "response_id engagement_id",
+		"evidence.chain_broken":            "engagement_id evidence_chain_id reason_code",
 	}
 	for _, spec := range EventCatalog() {
 		fields, ok := optionalEnvelope[spec.Type]

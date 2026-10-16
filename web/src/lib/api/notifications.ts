@@ -24,6 +24,14 @@ export type NotificationRuleFilter =
   | 'engagement_ids'
   | 'team_ids'
   | 'lead_time_seconds'
+  | 'finding_kinds'
+  | 'from_statuses'
+  | 'to_statuses'
+  | 'retest_results'
+  | 'scan_kinds'
+  | 'outcomes'
+  | 'providers'
+  | 'kinds'
 export type NotificationDataClass = 'signal' | 'summary' | 'detail'
 export type EngagementExternalNotifications = 'inherit' | 'signal' | 'none'
 export type NotificationLocale = 'en' | 'vi'
@@ -207,11 +215,19 @@ export interface NotificationRule {
   event_type: NotificationEventType
   min_severity?: string
   action_types?: string[]
+  finding_kinds?: string[]
+  from_statuses?: string[]
+  to_statuses?: string[]
+  retest_results?: string[]
+  scan_kinds?: string[]
+  kinds?: string[]
+  outcomes?: string[]
+  providers?: string[]
   engagement_ids?: string[]
   team_ids?: string[]
   all_teams?: boolean
   channel_ids: string[]
-  /** People to notify personally (#1415): assignee, team_member or engagement_lead. */
+  /** People to notify personally (#1415): assignee, team_member, engagement_lead, mentioned_user or approver. */
   recipient_roles?: string[]
   lead_time_seconds?: number
   revision: number
@@ -406,6 +422,14 @@ export const notificationsApi = {
         event_type: input.event_type,
         min_severity: input.min_severity,
         action_types: input.action_types,
+        finding_kinds: input.finding_kinds,
+        from_statuses: input.from_statuses,
+        to_statuses: input.to_statuses,
+        retest_results: input.retest_results,
+        scan_kinds: input.scan_kinds,
+        kinds: input.kinds,
+        outcomes: input.outcomes,
+        providers: input.providers,
         engagement_ids: input.engagement_ids,
         // PATCH replaces the whole rule, so an ownership rule must resend its team scope.
         team_ids: input.team_ids,

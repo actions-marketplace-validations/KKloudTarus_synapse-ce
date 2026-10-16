@@ -38,14 +38,15 @@ Some entries carry more than a switch:
   notification driver registry, minus any type named in
   `SYNAPSE_NOTIFICATION_PROVIDERS_DISABLED`. The console offers only these types when creating a
   channel. When the operator disables every type, `values` is omitted and no channel can be created.
-- `ticketing` and `docpublish` report `planned: true`. They are not in this build yet, so they are
-  always disabled and their `switch` is empty.
+- `ticketing` follows `SYNAPSE_TICKETING_ENABLED` (default `true`), exposing manual ticket
+  links and governed Jira creation. See [Jira ticketing](jira-ticketing.md).
+- `docpublish` reports `planned: true`; it remains disabled and its `switch` is empty.
 
 ```json
 {"key": "notifications.channel_types", "name": "Notification channel types", "enabled": true,
  "switch": "SYNAPSE_NOTIFICATIONS_ENABLED", "requires": ["notifications"],
  "values": ["webhook", "slack", "email", "teams", "telegram", "google_chat", "discord", "slack_bot"]}
-{"key": "ticketing", "name": "Ticketing", "enabled": false, "switch": "", "planned": true}
+{"key": "ticketing", "name": "Ticketing", "enabled": true, "switch": "SYNAPSE_TICKETING_ENABLED"}
 ```
 
 ## Required
@@ -126,7 +127,7 @@ Request logs and metrics contain no raw path IDs, credentials or tenant IDs.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `SYNAPSE_METRICS_ENABLED` | `false` | Expose Prometheus metrics on a SEPARATE listener (`SYNAPSE_METRICS_ADDR`). Off by default; the listener is never bearer-protected and is never itself instrumented. On an `all` profile worker with notifications enabled, it also exposes worker-owned delivery metrics. |
+| `SYNAPSE_METRICS_ENABLED` | `false` | Expose Prometheus metrics on a SEPARATE listener (`SYNAPSE_METRICS_ADDR`). Off by default; the listener is never bearer-protected and is never itself instrumented. On an `all` or `notifications` profile worker with notifications enabled, it also exposes worker-owned delivery metrics. |
 | `SYNAPSE_METRICS_ADDR` | `127.0.0.1:9090` | Metrics listener address. Loopback-only by default; widen it only onto a private scrape network, never a public interface. |
 | `SYNAPSE_ACCESS_LOG_ENABLED` | `true` | Emit one structured `http access` log event per request (method, matched route, status, latency, request id, and (once authenticated) the resolved principal id). Never logs raw paths, query strings, headers, bodies, tenant ids, remote addresses, user agents, or secrets. |
 
@@ -171,7 +172,7 @@ scrape_configs:
       - targets: ["127.0.0.1:9090"]
 ```
 
-The metrics listener has no authentication of its own. Keep `SYNAPSE_METRICS_ADDR` on loopback or a private network reachable only by your scrape infrastructure; do not put it behind the same reverse-proxy path as the bearer-protected API, and do not widen it to a public interface. The API warns when a configured metrics listener is non-loopback. A co-located `synapse-worker` must use a different metrics port (for example `127.0.0.1:9091`); its listener is enabled only in the `all` profile with notifications enabled. Worker delivery metric labels are fixed to `webhook/generic`, `slack/slack`, `email/smtp`, `teams/teams`, `telegram/telegram`, `google_chat/google_chat`, `discord/discord`, `slack_bot/slack` or `other/other`, never tenant or destination data.
+The metrics listener has no authentication of its own. Keep `SYNAPSE_METRICS_ADDR` on loopback or a private network reachable only by your scrape infrastructure; do not put it behind the same reverse-proxy path as the bearer-protected API, and do not widen it to a public interface. The API warns when a configured metrics listener is non-loopback. A co-located `synapse-worker` must use a different metrics port (for example `127.0.0.1:9091`); its listener is enabled in the `all` or `notifications` profile when notifications are enabled. Worker delivery metric labels are fixed to `webhook/generic`, `slack/slack`, `email/smtp`, `teams/teams`, `telegram/telegram`, `google_chat/google_chat`, `discord/discord`, `slack_bot/slack` or `other/other`, never tenant or destination data.
 
 ## Persistence
 
@@ -425,6 +426,7 @@ All off by default. The fleet needs PostgreSQL + `synapse-worker`; agents run on
 | `SYNAPSE_NOTIFICATION_UNSUBSCRIBE_URL` | (unset) | Optional absolute HTTPS URL for the operator's recipient-removal workflow. When set, every tenant Email channel message includes it in `List-Unsubscribe`; the receiver must perform recipient removal using its own state. Synapse never interpolates recipient or tenant data and does not advertise one-click unsubscribe. |
 | `SYNAPSE_NOTIFICATION_PROVIDERS_DISABLED` | (unset) | Operator kill switch: comma-separated channel and provider types no tenant may use, for example `slack,email`. Entries are trimmed, lowercased and deduplicated; empty entries are ignored. Every entry must be a type in this build's notification driver registry (`webhook`, `slack`, `email`, `teams`, `telegram`, `google_chat`, `discord`, `slack_bot`, `mattermost`, `rocket_chat`, `pagerduty`, `jsm`), so a typo stops API and worker startup. A disabled type is left out of the `notifications.channel_types` capability, creating or testing a channel of that type answers `400`, an existing channel of that type cannot be switched on or given a new destination (it can still be renamed, switched off or deleted), and the worker cancels its queued deliveries with `provider_disabled`. Set the same value on the API and the worker. Removing a type from the list restores its channels. It does not affect personal inbox mail or contact verification email. |
 | `SYNAPSE_NOTIFICATION_CHANNEL_PAUSE_THRESHOLD` | `5` | Read by `synapse-worker`. Consecutive permanent delivery failures (for example `destination_blocked` or an HTTP 404) after which a notification channel is paused automatically and tenant administrators get an in-app notice; an administrator resumes it from Settings > Alerting. Retryable failures (408, 429, 5xx, timeouts) never count, and a delivered message resets the count. `0` counts failures but never pauses. Must be between `0` and `100`; other values stop the worker at startup. See [Notifications](notifications.md#channel-health-and-automatic-pause). |
+| `SYNAPSE_NOTIFICATION_SLA_BREACH_MAX_REMINDERS` | `4` | Number of reminders after the first `sla.breached` event. The default schedule is 1, 2, 4 and 8 days after the breach; each additional reminder doubles the delay. `0` keeps the initial event and disables reminders. Supported range is `0` through `8`; other values stop API and worker startup. |
 | `SYNAPSE_TEAMS_BOT_APP_ID` | (unset) | Microsoft app ID (a GUID) of the operator's Azure Bot for Microsoft Teams personal delivery (#1420). Set on the API (link codes and the `/api/v1/teams/messages` messaging endpoint) and the worker (sending). Unset leaves Teams personal delivery off and its preferences unavailable. See [Notifications](notifications.md#microsoft-teams-personal-delivery). |
 | `SYNAPSE_TEAMS_BOT_APP_PASSWORD` | (unset) | The bot's client secret; required with `SYNAPSE_TEAMS_BOT_APP_ID`. Secret: sent only in the token request body to `login.microsoftonline.com`, never logged. |
 | `SYNAPSE_TEAMS_BOT_TENANT_ID` | (unset) | Microsoft Entra tenant ID (a GUID) of a single-tenant bot. Unset requests tokens from `botframework.com`, for a multi-tenant bot. An invalid value, or a password or tenant without an app ID, stops API and worker startup. |
@@ -445,7 +447,7 @@ All off by default. The fleet needs PostgreSQL + `synapse-worker`; agents run on
 | `SYNAPSE_LEADER_TERM` | `15s` | Lease term. |
 | `SYNAPSE_LEADER_RENEW` | `5s` | Renew interval. |
 | `SYNAPSE_WORKER_CONCURRENCY` | `1` | Durable queue claim loops per `synapse-worker` process; must be from 1 through 64. Jobs remain active on every worker, while maintenance sweepers are leader-gated when election is enabled. |
-| `SYNAPSE_WORKER_PROFILE` | `all` | `all` initializes hardened scanner handlers, captures ownership source evidence and requires the production sandbox. `integrations` claims only external-integration jobs. `lifecycle` claims Assessment comparison and closure-report jobs and, when ownership is enabled, also dispatches and consumes data-only ownership routing jobs. The two data-only profiles do not construct executable-tool handlers or require sandbox support. |
+| `SYNAPSE_WORKER_PROFILE` | `all` | `all` initializes hardened scanner handlers, captures ownership source evidence and requires the production sandbox. `integrations` claims only external-integration jobs. `lifecycle` claims Assessment comparison and closure-report jobs and, when ownership is enabled, also dispatches and consumes data-only ownership routing jobs. `notifications` claims only notification delivery, contact verification, and personal email/Slack/Teams jobs. It requires `SYNAPSE_NOTIFICATIONS_ENABLED=true` and the stable `SYNAPSE_VAULT_MASTER_KEY` shared with the API before it claims work. The three data-only profiles do not construct executable-tool handlers or require sandbox support. Notification maintenance uses its own leader lease; delivery and source idempotency remain in the shared tenant-scoped stores. |
 | `SYNAPSE_INTEGRATION_SCHEDULER_ENABLED` | `false` | Dispatch due external-integration polls. Requires PostgreSQL and `SYNAPSE_LEADER_ENABLED=true`; startup fails closed otherwise. |
 | `SYNAPSE_INTEGRATION_SCHEDULER_POLL` | `1m` | Interval for checking enabled integrations whose provider poll is due. |
 | `SYNAPSE_INTEGRATION_SCHEDULER_DISPATCH_LIMIT` | `10` | Maximum integration poll operations created per scheduler tick. |
@@ -504,6 +506,22 @@ All off by default. The fleet needs PostgreSQL + `synapse-worker`; agents run on
 | `SYNAPSE_DAST_MAX_PAGES` | `2000` | Maximum pages crawled. |
 | `SYNAPSE_DAST_MAX_WALL_CLOCK` | `30m` | Maximum crawl wall-clock. |
 | `SYNAPSE_DAST_HELPER_BIN` | `synapse-dast-helper` | Sandboxed DAST helper binary. |
+
+Engagement authorization-window notices use each rule's `lead_time_seconds`.
+Only draft or active standalone engagements with the selected future authorization
+boundary are eligible. Start and end boundaries are independent; an absent opposite
+boundary does not suppress a notice. Scheduling and relevance checks use UTC instants,
+while the stored time zone remains a display fact. A rescheduled boundary has a new
+source identity; queued notices for the old boundary are cancelled before sending.
+Choose a lead time that covers both the source-poll interval and delivery backlog.
+
+Finding mentions require explicit canonical `mention_user_ids` (at most ten unique
+users); plain `@name` text never selects recipients. Mention notices are personal and
+cannot fan out to shared channels. Approval recipients retain their captured reviewer
+membership, with current permissions checked again before personal delivery.
+Evidence-chain failures remain critical mandatory administrator notices, even with
+personal preferences disabled; recording an alert does not permit a broken-chain report.
+
 
 ## Recon and execution sandbox (sandbox required in production)
 
@@ -616,7 +634,7 @@ Provider receivers receive only the authenticated tenant/owner context and the b
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `SYNAPSE_METRICS_ENABLED` | `false` | Expose Prometheus metrics on a SEPARATE listener (`SYNAPSE_METRICS_ADDR`). Off by default; the listener is never bearer-protected and is never itself instrumented. On an `all` profile worker with notifications enabled, it also exposes worker-owned delivery metrics. |
+| `SYNAPSE_METRICS_ENABLED` | `false` | Expose Prometheus metrics on a SEPARATE listener (`SYNAPSE_METRICS_ADDR`). Off by default; the listener is never bearer-protected and is never itself instrumented. On an `all` or `notifications` profile worker with notifications enabled, it also exposes worker-owned delivery metrics. |
 | `SYNAPSE_METRICS_ADDR` | `127.0.0.1:9090` | Metrics listener address. Loopback-only by default; widen it only onto a private scrape network, never a public interface. |
 | `SYNAPSE_ACCESS_LOG_ENABLED` | `true` | Emit one structured `http access` log event per request (method, matched route, status, latency, request id, and (once authenticated) the resolved principal id). Never logs raw paths, query strings, headers, bodies, tenant ids, remote addresses, user agents, or secrets. |
 
@@ -661,7 +679,7 @@ scrape_configs:
       - targets: ["127.0.0.1:9090"]
 ```
 
-The metrics listener has no authentication of its own. Keep `SYNAPSE_METRICS_ADDR` on loopback or a private network reachable only by your scrape infrastructure; do not put it behind the same reverse-proxy path as the bearer-protected API, and do not widen it to a public interface. The API warns when a configured metrics listener is non-loopback. A co-located `synapse-worker` must use a different metrics port (for example `127.0.0.1:9091`); its listener is enabled only in the `all` profile with notifications enabled. Worker delivery metric labels are fixed to `webhook/generic`, `slack/slack`, `email/smtp`, `teams/teams`, `telegram/telegram`, `google_chat/google_chat`, `discord/discord`, `slack_bot/slack` or `other/other`, never tenant or destination data.
+The metrics listener has no authentication of its own. Keep `SYNAPSE_METRICS_ADDR` on loopback or a private network reachable only by your scrape infrastructure; do not put it behind the same reverse-proxy path as the bearer-protected API, and do not widen it to a public interface. The API warns when a configured metrics listener is non-loopback. A co-located `synapse-worker` must use a different metrics port (for example `127.0.0.1:9091`); its listener is enabled in the `all` or `notifications` profile when notifications are enabled. Worker delivery metric labels are fixed to `webhook/generic`, `slack/slack`, `email/smtp`, `teams/teams`, `telegram/telegram`, `google_chat/google_chat`, `discord/discord`, `slack_bot/slack` or `other/other`, never tenant or destination data.
 
 ## Persistence
 
