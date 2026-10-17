@@ -32,7 +32,7 @@ jobs:
       # runner, so this is not a persisted secret. It is masked in logs by the auth step below.
       SONAR_ADMIN_PASSWORD: Synapse-CI-Benchmark-1!
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Set up Go
         uses: actions/setup-go@v7
