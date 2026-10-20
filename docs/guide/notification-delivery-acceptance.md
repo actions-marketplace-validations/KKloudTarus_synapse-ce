@@ -559,3 +559,278 @@ Microsoft SMTP, mobile matrix or screen-reader certification is claimed.
 Only Teams/PagerDuty remain deferred. Issue ownership and the existing #1418/#1419
 integration closures are unchanged. This PR keeps `Refs` where an issue's complete
 cross-provider acceptance includes those deferrals; it does not close #1420 or #1576.
+
+## Personal inbox and bell state matrix on 2026-10-18
+
+The light/dark/state matrix the section above records as missing, for the notification bell
+and the inbox page (#1417). Every capture comes from the console in Chromium against an
+API serving PostgreSQL, authenticated as the bootstrap administrator and as a separate
+read-only operator. The notices in the list are the real administrator notices the product
+raised when a webhook destination was created and then moved, so the inbox content is
+product output rather than seeded rows. The dark captures and the deep-link journey were
+taken on 2026-10-19 against the same stack, with fresh notices raised the same way.
+
+| Surface | Light | Dark |
+| --- | --- | --- |
+| Inbox list, bell carrying two unread | [Light](assets/ui/ws4-console/inbox-list-light.png) | [Dark](assets/ui/ws4-console/inbox-list-dark.png) |
+| Transport failure while loading the list | [Light](assets/ui/ws4-console/inbox-error-light.png) | [Dark](assets/ui/ws4-console/inbox-error-dark.png) |
+| Unread-only filter | [Light](assets/ui/ws4-console/inbox-unread-filter-light.png) | |
+| Loading, request outstanding | [Light](assets/ui/ws4-console/inbox-loading-light.png) | [Dark](assets/ui/ws4-console/inbox-loading-dark.png) |
+| Unread list before Mark all read | | [Dark](assets/ui/ws4-console/inbox-unread-list-dark.png) |
+| The list straight after Mark all read | | [Dark](assets/ui/ws4-console/inbox-mark-all-dark.png) |
+| Unread empty after Mark all read | [Light](assets/ui/ws4-console/inbox-mark-all-empty-light.png) | [Dark](assets/ui/ws4-console/inbox-empty-dark.png) |
+| Bell with no badge after Mark all read | [Light](assets/ui/ws4-console/inbox-after-mark-all-bell-light.png) | |
+| A second operator's own empty inbox | [Light](assets/ui/ws4-console/inbox-reader-empty-light.png) | [Dark](assets/ui/ws4-console/inbox-reader-empty-dark.png) |
+| A notice about to be opened | [Light](assets/ui/ws4-console/inbox-deep-link-source-light.png) | [Dark](assets/ui/ws4-console/inbox-deep-link-source-dark.png) |
+| Where its own link lands | [Light](assets/ui/ws4-console/inbox-deep-link-destination-light.png) | [Dark](assets/ui/ws4-console/inbox-deep-link-destination-dark.png) |
+| The same destination for a reader | [Light](assets/ui/ws4-console/inbox-deep-link-denied-light.png) | [Dark](assets/ui/ws4-console/inbox-deep-link-denied-dark.png) |
+| 390-pixel viewport | [Light](assets/ui/ws4-console/inbox-mobile-light.png) | |
+
+How each state was produced, since a state that cannot be reproduced is not evidence:
+
+- The loading capture delays the real `GET /api/v1/me/inbox` by six seconds and screenshots
+  while it is outstanding. The response is the server's own.
+- The error capture aborts that request at the transport, which is what a dropped connection
+  looks like to the browser. No response body is substituted.
+- The empty capture is the state after the page's own Mark all read, with the unread filter
+  on. The bell capture that follows it is a fresh load of the same account.
+- The second operator is a real `readonly` user with their own API key, so their empty inbox
+  is the product's per-user scoping rather than a filtered view.
+- The deep-link journey clicks a notice in the list. The row names `/settings/alerting`,
+  the console navigates there, and the destination capture is that screen. The light
+  capture is taken with the notice unread; the dark one was taken after the light journey
+  had already read it, so it carries no unread badge. The notice itself was raised by
+  creating and then moving a webhook destination through `POST` and
+  `PATCH /api/v1/notifications/channels`, so the link target is the screen the event came
+  from.
+
+### Where authorization is refused in this journey
+
+`GET /api/v1/me/inbox` carries `PermView` and returns only the caller's own rows. Every
+human role in this tenant holds that permission, so no human reaches a denial on the inbox
+page: a `readonly` operator reaches their own list and finds it empty, which the capture
+above shows. A machine principal is refused, and
+`TestInboxRoutesRejectSpoofedIdentityAndMachineRoles` covers that, with no console state to
+capture because an agent has no browser session.
+
+The refusal a person can see in this journey is at the destination a notice links to. The
+`readonly` operator opening `/settings/alerting` gets the administrator-access screen:
+
+> Administrator access required. Only tenant administrators and integration administrators
+> can manage notification settings and delivery history.
+
+That screen is the client role gate: `Alerting.tsx` calls `load()` only when
+`canManageIntegrations(me.role)` is true, so this navigation issues no rules request. The
+server refuses the same read independently, which is a separate observation against the
+running API:
+
+```
+$ curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $READONLY_KEY" \
+    http://127.0.0.1:18080/api/v1/notifications/rules
+403
+```
+
+The captures in the row above are the client-side state, in both themes.
+
+One copy defect is visible in the error captures: the message names port 8080
+("Cannot reach the API. Is the server running on :8080?") even when the console reaches the
+API through another origin. It is recorded here rather than changed, because the string is
+shared by every page's error surface and belongs in its own change.
+
+## Rule builder picker state matrix on 2026-10-18
+
+The pickers #1421 added, captured from the console in Chromium against an API serving
+PostgreSQL. The directory behind them is real: two users, three engagements and three
+ownership teams created through the API before the run.
+
+| Surface | Light | Dark |
+| --- | --- | --- |
+| People picker open, options named `label (id)` | [Light](assets/ui/ws4-console/rule-people-picker-light.png) | [Dark](assets/ui/ws4-console/rule-people-picker-dark.png) |
+| Engagement picker filtered by a typed query | [Light](assets/ui/ws4-console/rule-engagement-picker-light.png) | [Dark](assets/ui/ws4-console/rule-engagement-picker-dark.png) |
+| Team picker on a rule that watches ownership | [Light](assets/ui/ws4-console/rule-picker-team-light.png) | [Dark](assets/ui/ws4-console/rule-picker-team-dark.png) |
+| A query the directory cannot match | [Light](assets/ui/ws4-console/rule-picker-empty-light.png) | [Dark](assets/ui/ws4-console/rule-picker-empty-dark.png) |
+| The directory read still outstanding | [Light](assets/ui/ws4-console/rule-picker-loading-light.png) | [Dark](assets/ui/ws4-console/rule-picker-loading-dark.png) |
+| The directory read failed | [Light](assets/ui/ws4-console/rule-picker-error-light.png) | [Dark](assets/ui/ws4-console/rule-picker-error-dark.png) |
+| Alerting as a read-only operator | [Light](assets/ui/ws4-console/alerting-permission-denied-light.png) | [Dark](assets/ui/ws4-console/alerting-permission-denied-dark.png) |
+
+All three picker types are covered: people, engagements and teams. The team picker appears
+on a rule whose event carries a team, so the capture selects `Finding ownership changed`
+and clears "All teams in this tenant", which is what enables the field. The three teams it
+lists were created through the API before the run.
+
+Each option carries its identifier, which is the point of the change: two people with the
+same display name stay apart, and a saved rule that names someone no longer in the
+directory keeps its selection rather than silently dropping it.
+
+The loading capture holds `GET /api/v1/notifications/rules/user-options` open and screenshots
+the picker's own "Searching…" line. The failure capture answers that read with 500, and the
+picker says `user directory unavailable` instead of looking like an empty directory. The
+no-match capture is a real search for a name nobody has.
+
+### What the read-only capture proves, and what it does not
+
+The denial screen is client-side: `Alerting.tsx` calls `load()` only when `canManage` is
+true and renders "Administrator access required" when it is not, so a `readonly` operator
+never issues `GET /api/v1/notifications/rules` from this page. The capture is evidence of
+the role gate, not of server enforcement.
+
+The server refuses the same read on its own, which is a separate observation against the
+running API:
+
+```
+$ curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $READONLY_KEY" \
+    http://127.0.0.1:18080/api/v1/notifications/rules
+403
+```
+
+The route carries `rt.authz(userdom.PermManageIntegrations, ...)` in
+`internal/adapter/httpapi/router.go`, and the hostile tenant harness covers the refusal
+paths. The same account's bell carries no badge, because the notices in this tenant are
+addressed to administrators.
+
+## Verified contact state matrix on 2026-10-18
+
+The My profile surface #1412 added, captured from the console in Chromium against an API
+serving PostgreSQL.
+
+| Surface | Light | Dark |
+| --- | --- | --- |
+| Contacts still loading | [Light](assets/ui/ws4-console/profile-contacts-loading-light.png) | [Dark](assets/ui/ws4-console/profile-contacts-loading-dark.png) |
+| No contacts yet | [Light](assets/ui/ws4-console/profile-contacts-empty-light.png) | [Dark](assets/ui/ws4-console/profile-contacts-empty-dark.png) |
+| Added, pending verification, with the code form | [Light](assets/ui/ws4-console/profile-contact-added-light.png) | [Dark](assets/ui/ws4-console/profile-contact-added-dark.png) |
+| An address the API rejects | [Light](assets/ui/ws4-console/profile-contact-api-rejected-light.png) | [Dark](assets/ui/ws4-console/profile-contact-api-rejected-dark.png) |
+| An address the browser refuses to submit | [Light](assets/ui/ws4-console/profile-contact-browser-validation-light.png) | [Dark](assets/ui/ws4-console/profile-contact-browser-validation-dark.png) |
+| Verification asked for with no relay configured | [Light](assets/ui/ws4-console/profile-contact-verify-unavailable-light.png) | [Dark](assets/ui/ws4-console/profile-contact-verify-unavailable-dark.png) |
+
+Two of these are the browser and the server disagreeing about the same field, and the
+difference matters:
+
+- The browser capture is Chromium's own warning on `not-an-address`. The field is
+  `type="email"` and `required`, so nothing is sent and no handler runs.
+- The API capture is the server's answer. The address is a 260-character local part, which
+  Chromium accepts and `POST /api/v1/me/contacts` refuses with HTTP 400. The page shows what
+  the server said: `validation error: invalid contact email`.
+
+The loading capture holds `GET /api/v1/me/contacts` open and screenshots the page's own
+`Loading contacts…` state. The added contact is a real row created through
+`POST /api/v1/me/contacts`, and the unavailable state is what an operator sees when the
+deployment has no SMTP relay: `RequestVerification` reports `email verification is
+unavailable` rather than queueing a code nobody can receive.
+
+The emailed code itself is not captured here. The operator relay is dialled through the
+same SSRF guard as every other destination, so it refuses a loopback or private address,
+and no public relay was available for this run. The code path is covered by
+`TestContactVerificationUsesExistingSMTPTransport` and by the PostgreSQL verification
+tests, which assert the single-use, per-user scoping of each challenge.
+
+There is no permission-denied state for this surface: every signed-in person manages
+their own contacts, and the routes derive the identity from the principal rather than
+from anything the caller sends.
+
+## Canonical assignee state matrix on 2026-10-18
+
+The original surfaces #1414 added were captured from the console in Chromium against an
+API serving PostgreSQL. Both findings and both assignments in that run are real rows
+written through `PUT /api/v1/engagements/{id}/findings/{id}/assignee`.
+The two assignee-search loading captures were retaken on 2026-10-20 in a focused browser
+fixture rendering the production `OwnershipInbox` and `UserPicker` with the current
+styles. Nonsecret API fixtures supply the team and findings; the browser holds the actual
+`GET /api/v1/users/picker` request before returning a response. Both captures wait for
+`Searching users…` and no eligible-results list. Releasing that request restores the
+Operator result. The other captures remain from the original API/PostgreSQL run.
+
+| Surface | Light | Dark |
+| --- | --- | --- |
+| A finding whose assignee bound to a user | [Light](assets/ui/ws4-console/finding-assignee-bound-light.png) | [Dark](assets/ui/ws4-console/finding-assignee-bound-dark.png) |
+| A finding whose label bound to nobody | [Light](assets/ui/ws4-console/finding-assignee-unbound-light.png) | [Dark](assets/ui/ws4-console/finding-assignee-unbound-dark.png) |
+| Finding ownership panel above the picker | [Light](assets/ui/ws4-console/finding-assignee-light.png) | [Dark](assets/ui/ws4-console/finding-assignee-dark.png) |
+| Assignee review with a label that bound to nobody | [Light](assets/ui/ws4-console/assignee-review-light.png) | [Dark](assets/ui/ws4-console/assignee-review-dark.png) |
+| Assignee review still loading | [Light](assets/ui/ws4-console/assignee-review-loading-light.png) | [Dark](assets/ui/ws4-console/assignee-review-loading-dark.png) |
+| Assignee review with nothing to review | [Light](assets/ui/ws4-console/assignee-review-empty-light.png) | [Dark](assets/ui/ws4-console/assignee-review-empty-dark.png) |
+| Assignee review when the read fails | [Light](assets/ui/ws4-console/assignee-review-error-light.png) | [Dark](assets/ui/ws4-console/assignee-review-error-dark.png) |
+| Assignee review as a read-only operator | [Light](assets/ui/ws4-console/assignee-review-denied-light.png) | [Dark](assets/ui/ws4-console/assignee-review-denied-dark.png) |
+| Ownership Inbox, where routed findings are taken on | [Light](assets/ui/ws4-console/ownership-inbox-light.png) | [Dark](assets/ui/ws4-console/ownership-inbox-dark.png) |
+| Inbox bulk assignment, with the assignee picker open | [Light](assets/ui/ws4-console/ownership-bulk-assign-light.png) | [Dark](assets/ui/ws4-console/ownership-bulk-assign-dark.png) |
+| The assignee search still outstanding | [Light](assets/ui/ws4-console/ownership-user-picker-loading-light.png) | [Dark](assets/ui/ws4-console/ownership-user-picker-loading-dark.png) |
+| The assignee search matching nobody | [Light](assets/ui/ws4-console/ownership-user-picker-empty-light.png) | [Dark](assets/ui/ws4-console/ownership-user-picker-empty-dark.png) |
+| The assignee search failing | [Light](assets/ui/ws4-console/ownership-user-picker-error-light.png) | [Dark](assets/ui/ws4-console/ownership-user-picker-error-dark.png) |
+| The inbox for an operator who cannot triage | [Light](assets/ui/ws4-console/ownership-inbox-readonly-light.png) | [Dark](assets/ui/ws4-console/ownership-inbox-readonly-dark.png) |
+
+The two finding captures are scrolled to the assignment control, so the picker, the stored
+label and the warning are all in frame. The loading capture holds
+`GET /api/v1/findings/assignee-review` open after the Settings route has mounted, so the
+heading and `Loading unresolved assignees…` are both on screen; the empty capture answers
+that read with no items; the failing capture answers 503 and the page reports it.
+
+### The assignee controls themselves
+
+The second assignment surface is the Ownership Inbox: select findings, choose
+`Assign team / person`, pick the destination team, and the same `UserPicker` the finding
+detail uses appears. Its states are captured on that surface, because it is the one where a
+search is driven by hand:
+
+- Results. `GET /api/v1/users/picker?team_id=…` returns the team's eligible members, and the
+  list shows `name (id)`. `Cloud operations` has two memberships; only `Operator (bootstrap
+  admin)` is offered, because the `readonly` member cannot act on a finding. That is the
+  same rule the bridge applies in migration `0182`.
+- Searching. The picker holds its own `Searching users…` line while the read is outstanding.
+- No match. A search for a name nobody has settles on `No eligible users found.`
+- Failure. A 503 on that read raises `user directory unavailable` beside the field.
+- Permission. An operator without triage permission gets no selection column and no bulk
+  card at all, which is the capture in the row above; the control cannot be reached to show
+  a disabled state, so no such capture exists.
+
+The finding-detail copy of the picker is the control in the bound and unbound captures
+above. Its search states are the same component and are not captured twice.
+
+The run exercises both outcomes of the identity bridge, which is the point of the change:
+
+- A finding assigned to the administrator binds. `findings.assignee_user_id` holds
+  `operator`, and no review row exists.
+- A finding assigned to a `readonly` person does not bind. `assignee_user_id` stays null and
+  the review queue carries one `unmatched` row.
+
+That second outcome is the rule in migration `0182`, not a defect. The bridge binds only a
+person who could act on the finding:
+
+```sql
+NEW.assignee_user_id := (
+ SELECT u.id FROM users u WHERE u.ownership_tenant_id=NEW.tenant_id
+  AND u.id=NEW.assignee AND NOT u.disabled
+  AND u.role IN ('admin','consultant','reviewer','member') LIMIT 1
+);
+```
+
+The console says the same thing in its own words next to the picker: "Legacy assignee label
+has no user binding. Choose a user above to enable personal routing." Personal routing skips
+the row until someone picks a person who can own it.
+
+The two captures show different people, and the difference is the point. On the unbound
+finding the ownership panel prints the stored label
+`manual assign · Assignee: 70db0073427a1ec832d97b106a2295c1`, which is the `readonly` user,
+while `Operator (bootstrap admin) (operator)` below it is an eligible replacement the
+picker offers, not the current assignee: the control's selection is empty because
+`assignee_user_id` is null. On the bound finding the same control reads
+`Selected: operator` with a Clear action and `Stored assignee label: operator`, which is
+what a successful binding looks like.
+
+One observation recorded rather than changed: the ownership panel prints the assignee as the
+raw identifier while the picker renders a person as `name (id)`. The stored reference is
+right; the panel's rendering of it is less readable than the picker's.
+
+### Where authorization is refused
+
+The read-only capture is the client role gate: `AssigneeReview.tsx` calls `load()` only when
+`canAdmin` is true and otherwise renders "Administrator access required", so that account
+issues no read from this page. The server refuses it independently, which is a separate
+observation against the running API:
+
+```
+$ curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $READONLY_KEY" \
+    http://127.0.0.1:18080/api/v1/findings/assignee-review
+403
+```
+
+The route carries `rt.authz(userdom.PermAdminister, ...)` in
+`internal/adapter/httpapi/router.go`, and the page also renders the same screen from a 403
+it receives, through its own `denied` state.
